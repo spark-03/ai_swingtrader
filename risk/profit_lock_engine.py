@@ -28,42 +28,50 @@ class ProfitLockEngine:
         ) / entry_price
 
         # ====================================
-        # DEFAULT
+        # DEFAULT RISK
         # ====================================
 
         locked_profit = -0.02
 
         # ====================================
-        # SMALL PROFITS
+        # BREAKEVEN
+        # ====================================
+
+        if profit_percent > 0.02:
+
+            locked_profit = 0.00
+
+        # ====================================
+        # SMALL PROFIT LOCK
         # ====================================
 
         if profit_percent > 0.04:
 
-            locked_profit = -0.005
-
-        # ====================================
-        # MEDIUM PROFITS
-        # ====================================
-
-        if profit_percent > 0.12:
-
             locked_profit = 0.015
 
         # ====================================
-        # LARGE PROFITS
+        # MEDIUM PROFIT LOCK
         # ====================================
 
-        if profit_percent > 0.12:
+        if profit_percent > 0.07:
 
-            locked_profit = 0.04
+            locked_profit = 0.035
 
         # ====================================
-        # HUGE PROFITS
+        # LARGE PROFIT LOCK
         # ====================================
 
-        if profit_percent > 0.12:
+        if profit_percent > 0.10:
 
-            locked_profit = 0.08
+            locked_profit = 0.06
+
+        # ====================================
+        # HUGE PROFIT LOCK
+        # ====================================
+
+        if profit_percent > 0.15:
+
+            locked_profit = 0.10
 
         locked_stop = (
 
@@ -75,4 +83,3 @@ class ProfitLockEngine:
         )
 
         return locked_stop
-

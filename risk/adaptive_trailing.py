@@ -37,39 +37,66 @@ class AdaptiveTrailingEngine:
         # BASE ATR MULTIPLIER
         # ====================================
 
-        atr_multiplier = 1.5
+        atr_multiplier = 2.0
 
         # ====================================
         # HIGH CONFIDENCE
         # ====================================
 
-        if confidence > 0.7:
+        if confidence > 0.75:
 
-            atr_multiplier += 1.0
+            atr_multiplier += 1.2
 
-        elif confidence > 0.5:
+        elif confidence > 0.60:
 
-            atr_multiplier += 0.5
+            atr_multiplier += 0.8
 
-        # ====================================
-        # STRONG MARKET QUALITY
-        # ====================================
+        elif confidence > 0.45:
 
-        if market_quality > 25:
-
-            atr_multiplier += 0.5
+            atr_multiplier += 0.4
 
         # ====================================
-        # LOCK PROFITS
+        # MARKET QUALITY
         # ====================================
 
-        if profit_percent > 0.05:
+        if market_quality > 30:
+
+            atr_multiplier += 0.8
+
+        elif market_quality > 20:
+
+            atr_multiplier += 0.4
+
+        # ====================================
+        # EARLY PROFIT LOCKING
+        # ====================================
+
+        if profit_percent > 0.02:
+
+            atr_multiplier -= 0.4
+
+        if profit_percent > 0.04:
 
             atr_multiplier -= 0.5
+
+        if profit_percent > 0.06:
+
+            atr_multiplier -= 0.6
 
         if profit_percent > 0.10:
 
-            atr_multiplier -= 0.5
+            atr_multiplier -= 0.8
+
+        # ====================================
+        # MINIMUM TRAIL LIMIT
+        # ====================================
+
+        atr_multiplier = max(
+
+            atr_multiplier,
+
+            0.8
+        )
 
         trailing_stop = (
 
@@ -79,5 +106,18 @@ class AdaptiveTrailingEngine:
 
             atr * atr_multiplier
         )
+
+        # ====================================
+        # BREAKEVEN PROTECTION
+        # ====================================
+
+        if profit_percent > 0.03:
+
+            trailing_stop = max(
+
+                trailing_stop,
+
+                entry_price
+            )
 
         return trailing_stop
