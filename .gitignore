@@ -1,0 +1,29 @@
+# Virtual Environment
+venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Models
+*.pth
+
+# Market Data
+data/
+*.parquet
+*.csv
+
+# Logs
+logs/
+
+# Environment Variables
+.env
+
+# Streamlit
+.streamlit/
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/

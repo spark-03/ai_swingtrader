@@ -1,0 +1,7 @@
+models:
+  - title: NVIDIA Llama
+    provider: openai
+    model: meta/llama-3.1-8b-instruct
+    apiBase: https://integrate.api.nvidia.com/v1
+    apiKey: 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// ... existing code ...
+
