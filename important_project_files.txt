@@ -1,0 +1,321 @@
+
+==================== main.py ====================
+
+print("AI Trading System Starting...")
+
+==================== config.py ====================
+
+
+==================== requirements.txt ====================
+
+
+==================== strategy\indicators.py ====================
+
+import pandas as pd
+
+from ta.momentum import RSIIndicator
+
+from ta.trend import EMAIndicator
+from ta.trend import ADXIndicator
+
+from ta.volatility import AverageTrueRange
+
+from ta.volume import VolumeWeightedAveragePrice
+
+
+def add_indicators(df):
+
+    # RSI
+    rsi = RSIIndicator(
+        close=df["close"],
+        window=14
+    )
+
+    df["RSI"] = rsi.rsi()
+
+    # EMA 9
+    ema_9 = EMAIndicator(
+        close=df["close"],
+        window=9
+    )
+
+    df["EMA_9"] = ema_9.ema_indicator()
+
+    # EMA 21
+    ema_21 = EMAIndicator(
+        close=df["close"],
+        window=21
+    )
+
+    df["EMA_21"] = ema_21.ema_indicator()
+
+    # VWAP
+    vwap = VolumeWeightedAveragePrice(
+
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        volume=df["volume"]
+    )
+
+    df["VWAP"] = vwap.volume_weighted_average_price()
+
+    # ATR
+    atr = AverageTrueRange(
+
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        window=14
+    )
+
+    df["ATR"] = atr.average_true_range()
+
+    # ADX
+    adx = ADXIndicator(
+
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        window=14
+    )
+
+    df["ADX"] = adx.adx()
+
+    return df
+
+==================== backtesting\backtester.py ====================
+
+from strategy.indicators import add_indicators
+from strategy.signal_engine import generate_signal
+from paper_trading.exit_manager import manage_exit
+from strategy.market_regime import detect_market_regime
+from risk.position_sizer import calculate_position_size
+from strategy.confidence_score import calculate_confidence
+
+def run_backtest(df):
+
+    trades = []
+
+    # Add indicators
+    df = add_indicators(df)
+
+    # Start after indicators stabilize
+    for i in range(30, len(df) - 10):
+
+        current_df = df.iloc[:i]
+
+        latest = current_df.iloc[-1]
+
+        signal_data = generate_signal(current_df)
+
+        signal = signal_data["signal"]
+        # Confidence score
+        confidence = calculate_confidence(
+    current_df
+)       
+        # Skip weak setups
+        if confidence < 75:
+
+         continue
+        # Detect market regime
+        regime = detect_market_regime(current_df)
+        # Position sizing
+        capital = calculate_position_size(regime)
+        
+        # Skip sideways markets
+        if regime == "SIDEWAYS":
+         continue
+
+        # Skip HOLD trades
+        if signal == "HOLD":
+            continue
+
+        # Entry price
+        entry_price = latest["close"]
+
+        # ATR for dynamic exits
+        atr = latest["ATR"]
+
+        # Future candles for exit management
+        future_candles = df.iloc[i:i + 10]
+
+        # Dynamic ATR-based exit management
+        exit_data = manage_exit(
+            signal,
+            entry_price,
+            future_candles,
+            atr
+        )
+
+        exit_price = exit_data["exit_price"]
+
+        # Calculate PnL
+        if signal == "BUY":
+
+            pnl = exit_price - entry_price
+
+        else:
+
+            pnl = entry_price - exit_price
+
+        # Store trade
+        trade = {
+
+            "signal": signal,
+            "confidence": confidence,
+
+            "entry_price": float(round(entry_price, 2)),
+            "exit_price": float(round(exit_price, 2)),
+
+            "pnl": float(round(pnl, 2)),
+
+            "exit_reason": exit_data["exit_reason"],
+            "market_regime": regime,
+            "capital": capital,
+
+            "atr": float(round(atr, 2))
+        }
+
+        trades.append(trade)
+
+    return trades
+
+==================== utils\logger.py ====================
+
+import logging
+import sys
+from pathlib import Path
+
+# ----------------------------------------------------------------------
+# Logger configuration
+# ----------------------------------------------------------------------
+
+LOG_FORMAT = "[%(asctime)s] %(levelname)s %(name)s - %(message)s"
+DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+def get_logger(name: str = "ai_trading", log_file: str | None = None, level: int = logging.INFO) -> logging.Logger:
+    """Create or retrieve a configured logger.
+
+    Parameters
+    ----------
+    name: str
+        Logger name (usually ``__name__``).
+    log_file: str | None, optional
+        Path to a file where logs should also be written. If ``None`` only console
+        output is used.
+    level: int, default ``logging.INFO``
+        Logging level.
+
+    Returns
+    -------
+    logging.Logger
+        Configured logger instance.
+    """
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        # Logger already configured – avoid duplicate handlers.
+        return logger
+
+    logger.setLevel(level)
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
+
+    # Console handler (stdout)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # Optional file handler
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
+
+# A module‑level default logger for quick imports
+default_logger = get_logger()
+
+==================== utils\helpers.py ====================
+
+
+==================== test_indicators.py ====================
+
+from data.candle_fetcher import fetch_candles
+from data.nifty100_tokens import TOKENS
+from strategy.indicators import add_indicators
+
+
+TOKEN = TOKENS["RELIANCE-EQ"]
+
+df = fetch_candles(TOKEN)
+
+if df is not None:
+
+    df = add_indicators(df)
+
+    print(
+        df[
+            [
+                "datetime",
+                "close",
+                "RSI",
+                "EMA_9",
+                "EMA_21",
+                "VWAP"
+            ]
+        ].tail()
+    )
+
+==================== test_portfolio.py ====================
+
+from backtesting.portfolio_backtester import (
+    run_portfolio_backtest
+)
+
+from backtesting.performance_tracker import (
+    analyze_performance
+)
+
+from backtesting.equity_curve import (
+    build_equity_curve
+)
+
+from backtesting.drawdown import (
+    calculate_drawdown
+)
+
+
+# Run portfolio backtest
+trades = run_portfolio_backtest()
+
+print("\nPORTFOLIO RESULTS:\n")
+
+for trade in trades[:20]:
+
+    print(trade)
+
+# Portfolio performance
+performance = analyze_performance(
+    trades
+)
+
+print("\nPORTFOLIO PERFORMANCE:\n")
+
+print(performance)
+
+# Portfolio equity curve
+equity_curve = build_equity_curve(
+    trades
+)
+
+# Portfolio drawdown
+max_drawdown = calculate_drawdown(
+    equity_curve
+)
+
+print("\nPORTFOLIO MAX DRAWDOWN:\n")
+
+print(f"{max_drawdown}%")

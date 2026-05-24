@@ -1,4 +1,22 @@
-import numpy as np
+import argparse
+
+# Argument parser for optional data folder and symbol name
+parser = argparse.ArgumentParser(description='Train DQN on multi‑stock data')
+parser.add_argument('--data', type=str, default='data/features/5min', help='Path to folder containing parquet files for training')
+parser.add_argument('--symbol', type=str, default='generic', help='Symbol name for checkpoint naming')
+args = parser.parse_args()
+
+# Load dataset: concatenate all parquet files in the data folder
+if os.path.isdir(args.data):
+    parquet_files = [os.path.join(args.data, f) for f in os.listdir(args.data) if f.endswith('.parquet')]
+    if not parquet_files:
+        raise FileNotFoundError(f'No parquet files found in {args.data}')
+    df_list = [pd.read_parquet(p) for p in parquet_files]
+    df = pd.concat(df_list, ignore_index=True)
+else:
+    # Fallback to single parquet file path if a file is provided
+    df = pd.read_parquet(args.data)
+
 import pandas as pd
 import torch
 
@@ -186,7 +204,9 @@ for episode in range(EPISODES):
 # SAVE MODEL
 # ====================================
 
-model_path = "multi_stock_dqn.pth"
+os.makedirs("models", exist_ok=True)
+os.makedirs('models', exist_ok=True)
+model_path = os.path.join('models', f"{args.symbol}_dqn.pth")
 
 torch.save(
 

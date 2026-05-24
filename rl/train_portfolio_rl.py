@@ -8,8 +8,12 @@ import torch.optim as optim
 import numpy as np
 import pandas as pd
 
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from rl.dqn_model import DQN
-
+from configs.training_symbols import (
+    TRAINING_SYMBOLS
+)
 from rl.portfolio_environment import (
     PortfolioEnvironment
 )
@@ -17,6 +21,7 @@ from rl.portfolio_environment import (
 from rl.prioritized_replay_buffer import (
     PrioritizedReplayBuffer
 )
+
 
 # ====================================
 # DEVICE
@@ -34,7 +39,7 @@ print(f"\nUsing Device: {device}")
 # CONFIG
 # ====================================
 
-EPISODES = 1000
+EPISODES = 20
 
 BATCH_SIZE = 32
 
@@ -177,21 +182,35 @@ for file_name in os.listdir(FIVE_FOLDER):
 # ====================================
 # COMMON SYMBOLS
 # ====================================
+# ====================================
+# COMMON SYMBOLS
+# ====================================
 
-common_symbols = list(
+common_symbols = [
 
-    set(daily_data.keys())
+    symbol
 
-    &
+    for symbol in TRAINING_SYMBOLS
 
-    set(hourly_data.keys())
+    if (
 
-    &
+        symbol in daily_data
 
-    set(five_data.keys())
+        and
+
+        symbol in hourly_data
+
+        and
+
+        symbol in five_data
+    )
+]
+
+print(
+
+    f"\nElite RL Symbols: "
+    f"{len(common_symbols)}"
 )
-
-print(f"\nCommon Symbols: {len(common_symbols)}")
 
 # ====================================
 # FILTER
@@ -313,6 +332,8 @@ memory = PrioritizedReplayBuffer(
 start_episode = 1
 
 epsilon = EPSILON
+# Ensure 'episode' is defined even if the training loop is skipped
+episode = start_episode
 
 if os.path.exists(
 
@@ -687,11 +708,29 @@ for episode in range(
 
 print("\n========== TRAINING COMPLETE ==========")
 
-print(
-
-    f"\nBest PnL Achieved: "
-    f"{best_pnl:.2f}"
-)
+# ====================================
+# POST-TRAINING EVALUATION
+# ====================================
+print("\nRunning evaluation episode with trained policy...")
+# Deterministic actions for evaluation
+epsilon = 0.0
+eval_state = env.reset()
+total_reward = 0.0
+done = False
+step = 0
+while not done and step < 300:
+    state_tensor = torch.FloatTensor(eval_state).unsqueeze(0).to(device)
+    with torch.no_grad():
+        q_vals = policy_net(state_tensor)
+        action = torch.argmax(q_vals).item()
+    eval_state, reward, done, _ = env.step(action)
+    total_reward += reward
+    step += 1
+print(f"Evaluation completed in {step} steps. Total reward: {total_reward:.4f}")
+eval_metrics = env.get_metrics()
+print("Evaluation metrics:")
+for k, v in eval_metrics.items():
+    print(f"{k}: {v}")
 
 checkpoint = {
 

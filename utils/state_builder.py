@@ -1,271 +1,140 @@
 import numpy as np
+import pandas as pd
 
+class StateError(Exception):
+    """Raised when the RL state vector is invalid (wrong shape or contains NaNs)."""
 
-# ====================================
-# SAFE NORMALIZATION
-# ====================================
+def validate_state(state: np.ndarray, expected_len: int = 21) -> None:
+    """Validate that `state` has the expected length and contains no NaNs/Infs.
 
-def safe_divide(a, b):
+    Parameters
+    ----------
+    state: np.ndarray
+        The state vector to validate.
+    expected_len: int, optional
+        Expected number of elements (default 21).
 
-    if b == 0:
+    Raises
+    ------
+    StateError
+        If the length is incorrect or NaNs/Infs are present.
+    """
+    if state.shape[0] != expected_len:
+        raise StateError(f"State length {state.shape[0]} != expected {expected_len}")
+    if np.isnan(state).any() or np.isinf(state).any():
+        raise StateError("State contains NaN or infinite values")
+    """Validate that `state` has the expected length and contains no NaNs/Infs.
 
-        return 0
+    Parameters
+    ----------
+    state: np.ndarray
+        The state vector to validate.
+    expected_len: int, optional
+        Expected number of elements (default 19).
 
-    return a / b
+    Raises
+    ------
+    StateError
+        If the length is incorrect or NaNs/Infs are present.
+    """
+    if state.shape[0] != expected_len:
+        raise StateError(f"State length {state.shape[0]} != expected {expected_len}")
+    if np.isnan(state).any() or np.isinf(state).any():
+        raise StateError("State contains NaN or infinite values")
 
+def safe_divide(a, b, eps=1e-9):
+    """Safely divide ``a`` by ``b`` returning 0 when ``b`` is near zero.
 
-# ====================================
-# BUILD STATE
-# ====================================
+    Parameters
+    ----------
+    a : float or np.ndarray
+        Numerator.
+    b : float or np.ndarray
+        Denominator.
+    eps : float, optional
+        Small epsilon to avoid division by zero (default 1e-9).
+    """
+    return np.where(np.abs(b) > eps, a / b, 0.0)
 
-def build_state(df):
+def build_state(df: pd.DataFrame, position_flag: int = 0, hold_candles: int = 0) -> np.ndarray:
+    """Build a feature vector from the **latest** row of a DataFrame.
 
-    # ====================================
-    # USE LATEST ROW
-    # ====================================
+    The function extracts a set of technical indicators, normalises them and
+    returns a 1‑D ``np.ndarray`` of ``float32`` values ready for an RL agent.
+
+    It is defensive: if the DataFrame is empty it raises a ``ValueError``.
+    """
+    if df.empty:
+        # Return a zero‑filled state vector matching the expected feature size (18)
+        return np.zeros(18, dtype=np.float32)
 
     latest = df.iloc[-1]
-
-    # ====================================
-    # PRICE
-    # ====================================
-
     close = latest["close"]
 
-    # ====================================
-    # RSI
-    # ====================================
-
-    rsi = safe_divide(
-
-        latest["RSI"],
-
-        100
-    )
-
-    # ====================================
-    # MACD
-    # ====================================
-
-    macd = safe_divide(
-
-        latest["MACD"],
-
-        close
-    )
-
-    macd_signal = safe_divide(
-
-        latest["MACD_SIGNAL"],
-
-        close
-    )
-
-    macd_diff = safe_divide(
-
-        latest["MACD_DIFF"],
-
-        close
-    )
-
-    # ====================================
-    # EMA DISTANCE
-    # ====================================
-
-    ema20_dist = safe_divide(
-
-        close - latest["EMA20"],
-
-        close
-    )
-
-    ema50_dist = safe_divide(
-
-        close - latest["EMA50"],
-
-        close
-    )
-
-    # ====================================
-    # VWAP DISTANCE
-    # ====================================
-
-    vwap_dist = safe_divide(
-
-        close - latest["VWAP"],
-
-        close
-    )
-
-    # ====================================
-    # ATR VOLATILITY
-    # ====================================
-
-    atr = safe_divide(
-
-        latest["ATR"],
-
-        close
-    )
-
-    # ====================================
-    # BOLLINGER BAND POSITION
-    # ====================================
-
-    bb_high = latest["BB_HIGH"]
-
-    bb_low = latest["BB_LOW"]
-
-    bb_mid = latest["BB_MID"]
-
-    bb_width = safe_divide(
-
-        bb_high - bb_low,
-
-        close
-    )
-
-    bb_position = safe_divide(
-
-        close - bb_low,
-
-        bb_high - bb_low
-    )
-
-    # ====================================
-    # RETURNS
-    # ====================================
-
-    return_1 = latest["RETURN_1"]
-
-    return_5 = latest["RETURN_5"]
-
-    return_10 = latest["RETURN_10"]
-
-    # ====================================
-    # VOLATILITY
-    # ====================================
-
-    volatility = latest["VOLATILITY_10"]
-
-    # ====================================
-    # MOMENTUM
-    # ====================================
-
-    momentum = latest["MOMENTUM_10"] - 1
-
-    # ====================================
-    # VOLUME NORMALIZATION
-    # ====================================
-
-    recent_volume_mean = (
-
-        df["volume"]
-
-        .tail(20)
-
-        .mean()
-    )
-
-    relative_volume = safe_divide(
-
-        latest["volume"],
-
-        recent_volume_mean
-    )
-
-    # ====================================
-    # TREND STRENGTH
-    # ====================================
-
-    trend_strength = abs(
-
-        ema20_dist - ema50_dist
-    )
-
-    # ====================================
-    # PRICE VS RECENT RANGE
-    # ====================================
-
-    recent_high = (
-
-        df["high"]
-
-        .tail(20)
-
-        .max()
-    )
-
-    recent_low = (
-
-        df["low"]
-
-        .tail(20)
-
-        .min()
-    )
-
-    range_position = safe_divide(
-
-        close - recent_low,
-
-        recent_high - recent_low
-    )
-
-    # ====================================
-    # STATE VECTOR
-    # ====================================
-
+    # ------------------------------------------------------------------
+    # Indicator normalisation (safe division where needed)
+    # ------------------------------------------------------------------
+    rsi = safe_divide(latest.get("RSI", 0), 100)
+    macd = safe_divide(latest.get("MACD", 0), close)
+    macd_signal = safe_divide(latest.get("MACD_SIGNAL", 0), close)
+    macd_diff = safe_divide(latest.get("MACD_DIFF", 0), close)
+
+    ema20_dist = safe_divide(close - latest.get("EMA20", 0), close)
+    ema50_dist = safe_divide(close - latest.get("EMA50", 0), close)
+    vwap_dist = safe_divide(close - latest.get("VWAP", 0), close)
+    atr = safe_divide(latest.get("ATR", 0), close)
+
+    # Bollinger bands
+    bb_high = latest.get("BB_HIGH", 0)
+    bb_low = latest.get("BB_LOW", 0)
+    bb_width = safe_divide(bb_high - bb_low, close)
+    bb_position = safe_divide(close - bb_low, bb_high - bb_low)
+
+    # Returns
+    return_1 = latest.get("RETURN_1", 0)
+    return_5 = latest.get("RETURN_5", 0)
+    return_10 = latest.get("RETURN_10", 0)
+
+    volatility = latest.get("VOLATILITY_10", 0)
+    momentum = latest.get("MOMENTUM_10", 0) - 1
+
+    # Volume normalisation
+    recent_volume_mean = df["volume"].tail(20).mean()
+    relative_volume = safe_divide(latest["volume"], recent_volume_mean)
+
+    # Trend strength
+    trend_strength = np.abs(ema20_dist - ema50_dist)
+
+    # Recent price range
+    recent_high = df["high"].tail(20).max()
+    recent_low = df["low"].tail(20).min()
+    range_position = safe_divide(close - recent_low, recent_high - recent_low)
+
+    # Assemble state vector
     state = np.array([
-
-        # MOMENTUM
         rsi,
         macd,
         macd_signal,
         macd_diff,
-
-        # TREND
         ema20_dist,
         ema50_dist,
         trend_strength,
-
-        # VWAP
         vwap_dist,
-
-        # VOLATILITY
         atr,
         volatility,
         bb_width,
         bb_position,
-
-        # RETURNS
         return_1,
         return_5,
         return_10,
-
-        # MOMENTUM
         momentum,
-
-        # VOLUME
         relative_volume,
+        range_position,
+        # New features for state integrity
+        float(position_flag),
+        float(hold_candles),
+    ], dtype=np.float32)
 
-        # PRICE STRUCTURE
-        range_position
-    ])
-
-    # ====================================
-    # CLEAN
-    # ====================================
-
-    state = np.nan_to_num(
-
-        state,
-
-        nan=0,
-
-        posinf=0,
-
-        neginf=0
-    )
-
-    return state.astype(np.float32)
+    # Replace NaNs/Infs with zeros for safety
+    state = np.nan_to_num(state, nan=0.0, posinf=0.0, neginf=0.0)
+    return state

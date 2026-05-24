@@ -1,73 +1,262 @@
 import pandas as pd
 
-from ta.trend import EMAIndicator, ADXIndicator
-from ta.momentum import RSIIndicator
-from ta.volatility import AverageTrueRange
-from ta.volume import VolumeWeightedAveragePrice
+import numpy as np
 
 
 def add_indicators(df):
 
-    # =========================
+    df = df.copy()
+
+    # ====================================
     # EMA
-    # =========================
+    # ====================================
 
-    df["EMA_9"] = EMAIndicator(
-        close=df["close"],
-        window=9
-    ).ema_indicator()
+    df["EMA20"] = (
 
-    df["EMA_21"] = EMAIndicator(
-        close=df["close"],
-        window=21
-    ).ema_indicator()
+        df["close"]
 
-    # =========================
+        .ewm(
+            span=20,
+            adjust=False
+        )
+
+        .mean()
+    )
+
+    df["EMA50"] = (
+
+        df["close"]
+
+        .ewm(
+            span=50,
+            adjust=False
+        )
+
+        .mean()
+    )
+
+    # ====================================
     # RSI
-    # =========================
+    # ====================================
 
-    df["RSI"] = RSIIndicator(
-        close=df["close"],
-        window=14
-    ).rsi()
+    delta = df["close"].diff()
 
-    # =========================
-    # VWAP
-    # =========================
+    gain = delta.clip(lower=0)
 
-    df["VWAP"] = VolumeWeightedAveragePrice(
-        high=df["high"],
-        low=df["low"],
-        close=df["close"],
-        volume=df["volume"]
-    ).volume_weighted_average_price()
+    loss = -delta.clip(upper=0)
 
-    # =========================
+    avg_gain = gain.rolling(14).mean()
+
+    avg_loss = loss.rolling(14).mean()
+
+    rs = avg_gain / (avg_loss + 1e-9)
+
+    df["RSI"] = (
+
+        100
+
+        -
+
+        (
+            100
+            /
+            (1 + rs)
+        )
+    )
+
+    # ====================================
+    # MACD
+    # ====================================
+
+    ema12 = df["close"].ewm(
+        span=12,
+        adjust=False
+    ).mean()
+
+    ema26 = df["close"].ewm(
+        span=26,
+        adjust=False
+    ).mean()
+
+    df["MACD"] = (
+        ema12 - ema26
+    )
+
+    df["MACD_SIGNAL"] = (
+
+        df["MACD"]
+
+        .ewm(
+            span=9,
+            adjust=False
+        )
+
+        .mean()
+    )
+
+    df["MACD_DIFF"] = (
+
+        df["MACD"]
+
+        -
+
+        df["MACD_SIGNAL"]
+    )
+
+    # ====================================
     # ATR
-    # =========================
+    # ====================================
 
-    df["ATR"] = AverageTrueRange(
-        high=df["high"],
-        low=df["low"],
-        close=df["close"],
-        window=14
-    ).average_true_range()
+    high_low = (
+        df["high"] - df["low"]
+    )
 
-    # =========================
-    # ADX
-    # =========================
+    high_close = (
 
-    df["ADX"] = ADXIndicator(
-        high=df["high"],
-        low=df["low"],
-        close=df["close"],
-        window=14
-    ).adx()
+        (
+            df["high"]
+            -
+            df["close"].shift()
+        )
 
-    # =========================
-    # REMOVE NaN ROWS
-    # =========================
+        .abs()
+    )
 
-    df.dropna(inplace=True)
+    low_close = (
+
+        (
+            df["low"]
+            -
+            df["close"].shift()
+        )
+
+        .abs()
+    )
+
+    true_range = pd.concat([
+
+        high_low,
+
+        high_close,
+
+        low_close
+
+    ], axis=1).max(axis=1)
+
+    df["ATR"] = (
+        true_range
+        .rolling(14)
+        .mean()
+    )
+
+    # ====================================
+    # VWAP
+    # ====================================
+
+    typical_price = (
+
+        df["high"]
+
+        +
+
+        df["low"]
+
+        +
+
+        df["close"]
+
+    ) / 3
+
+    cumulative_tpv = (
+        typical_price * df["volume"]
+    ).cumsum()
+
+    cumulative_volume = (
+        df["volume"]
+    ).cumsum()
+
+    df["VWAP"] = (
+
+        cumulative_tpv
+
+        /
+
+        (
+            cumulative_volume
+            + 1e-9
+        )
+    )
+
+    # ====================================
+    # BOLLINGER BANDS
+    # ====================================
+
+    bb_mid = (
+        df["close"]
+        .rolling(20)
+        .mean()
+    )
+
+    bb_std = (
+        df["close"]
+        .rolling(20)
+        .std()
+    )
+
+    df["BB_MID"] = bb_mid
+
+    df["BB_HIGH"] = (
+        bb_mid + 2 * bb_std
+    )
+
+    df["BB_LOW"] = (
+        bb_mid - 2 * bb_std
+    )
+
+    # ====================================
+    # RETURNS
+    # ====================================
+
+    df["RETURN_1"] = (
+        df["close"].pct_change(1)
+    )
+
+    df["RETURN_5"] = (
+        df["close"].pct_change(5)
+    )
+
+    df["RETURN_10"] = (
+        df["close"].pct_change(10)
+    )
+
+    # ====================================
+    # VOLATILITY
+    # ====================================
+
+    df["VOLATILITY_10"] = (
+
+        df["RETURN_1"]
+
+        .rolling(10)
+
+        .std()
+    )
+
+    # ====================================
+    # MOMENTUM
+    # ====================================
+
+    df["MOMENTUM_10"] = (
+
+        df["close"]
+
+        /
+
+        (
+            df["close"]
+            .shift(10)
+            + 1e-9
+        )
+    )
 
     return df

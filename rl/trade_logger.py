@@ -1,8 +1,61 @@
+import pandas as pd
+
+import os
+
+
 class TradeLogger:
 
-    def __init__(self):
+    def __init__(
 
-        self.trades = []
+        self,
+
+        log_file="rl_trade_log.csv"
+    ):
+
+        self.log_file = log_file
+
+        # ====================================
+        # CREATE FILE
+        # ====================================
+
+        if not os.path.exists(
+
+            self.log_file
+        ):
+
+            df = pd.DataFrame(columns=[
+
+                "symbol",
+
+                "entry_price",
+
+                "exit_price",
+
+                "pnl",
+
+                "reward",
+
+                "confidence",
+
+                "regime",
+
+                "holding_steps",
+
+                "exit_reason",
+
+                "market_quality",
+
+                "volatility_ratio",
+
+                "profitable"
+            ])
+
+            df.to_csv(
+
+                self.log_file,
+
+                index=False
+            )
 
     # ====================================
     # LOG TRADE
@@ -12,7 +65,7 @@ class TradeLogger:
 
         self,
 
-        direction,
+        symbol,
 
         entry_price,
 
@@ -20,29 +73,69 @@ class TradeLogger:
 
         pnl,
 
-        holding_time
+        reward,
 
+        confidence,
+
+        regime,
+
+        holding_steps,
+
+        exit_reason,
+
+        market_quality,
+
+        volatility_ratio
     ):
 
-        trade = {
+        row = {
 
-            "direction": str(direction),
+            "symbol":
+            symbol,
 
-            "entry_price": float(entry_price),
+            "entry_price":
+            entry_price,
 
-            "exit_price": float(exit_price),
+            "exit_price":
+            exit_price,
 
-            "pnl": float(pnl),
+            "pnl":
+            pnl,
 
-            "holding_time": int(holding_time)
+            "reward":
+            reward,
+
+            "confidence":
+            confidence,
+
+            "regime":
+            regime,
+
+            "holding_steps":
+            holding_steps,
+
+            "exit_reason":
+            exit_reason,
+
+            "market_quality":
+            market_quality,
+
+            "volatility_ratio":
+            volatility_ratio,
+
+            "profitable":
+            pnl > 0
         }
 
-        self.trades.append(trade)
+        df = pd.DataFrame([row])
 
-    # ====================================
-    # GET TRADES
-    # ====================================
+        df.to_csv(
 
-    def get_trades(self):
+            self.log_file,
 
-        return self.trades
+            mode="a",
+
+            header=False,
+
+            index=False
+        )

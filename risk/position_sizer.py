@@ -1,27 +1,18 @@
 class PositionSizer:
 
-    def __init__(
+    def __init__(self):
 
-        self,
-
-        min_size=0.05,
-
-        max_size=0.30
-    ):
-
-        self.min_size = min_size
-
-        self.max_size = max_size
+        pass
 
     # ====================================
-    # CALCULATE POSITION SIZE
+    # POSITION SIZE
     # ====================================
 
     def calculate(
 
         self,
 
-        market_quality_score,
+        market_quality,
 
         volatility_ratio,
 
@@ -32,56 +23,69 @@ class PositionSizer:
         # BASE SIZE
         # ====================================
 
-        size = 0.10
+        size = 0.08
 
         # ====================================
-        # MARKET QUALITY BOOST
+        # MARKET QUALITY
         # ====================================
 
-        if market_quality_score > 25:
+        if market_quality > 35:
 
-            size += 0.10
+            size += 0.16
 
-        elif market_quality_score > 18:
+        elif market_quality > 25:
 
-            size += 0.05
+            size += 0.011
+
+        elif market_quality > 15:
+
+            size += 0.06
 
         # ====================================
-        # BULLISH ALIGNMENT BOOST
+        # BULLISH ALIGNMENT
         # ====================================
 
         if bullish_alignment:
 
-            size += 0.05
+            size += 0.04
 
         # ====================================
-        # HIGH VOLATILITY REDUCTION
+        # VOLATILITY REDUCTION
         # ====================================
-
-        if volatility_ratio > 0.03:
-
-            size -= 0.05
 
         if volatility_ratio > 0.05:
 
-            size -= 0.10
+            size *= 0.50
+
+        elif volatility_ratio > 0.04:
+
+            size *= 0.70
+
+        elif volatility_ratio > 0.03:
+
+            size *= 0.85
 
         # ====================================
-        # CLAMP
+        # HARD LIMITS
         # ====================================
 
-        size = max(
+        size = max(size, 0.03)
 
-            self.min_size,
-
-            size
-        )
-
-        size = min(
-
-            self.max_size,
-
-            size
-        )
+        size = min(size, 0.25)
 
         return size
+
+
+def calculate_position_size(regime):
+    """
+    Backward-compatible helper used by backtesting pipeline.
+    Maps regime labels to conservative position fractions.
+    """
+    regime_key = str(regime).upper()
+    if regime_key in ("TRENDING", "TRENDING_BULL", "TRENDING_BEAR"):
+        return 0.15
+    if regime_key == "VOLATILE":
+        return 0.07
+    if regime_key == "LOW_VOLUME":
+        return 0.05
+    return 0.08

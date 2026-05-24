@@ -1,888 +1,360 @@
 import random
-import numpy as np
+from typing import Any, Dict, Tuple
 
+# ----------------------------------------------------------------------
+# Engine / component imports
+# ----------------------------------------------------------------------
 from execution.trade_validator import TradeValidator
-
+from ai.filters.elite_opportunity_filter import EliteOpportunityFilter
+from ai.elite_scoring import EliteScoring
+from data.stock_universe import get_allowed_symbols
 from risk.position_sizer import PositionSizer
-
-from execution.trade_confidence import (
-    TradeConfidenceEngine
-)
-
 from risk.risk_manager import RiskManager
-
-from utils.market_quality_analyzer import (
-    MarketQualityAnalyzer
-)
-
-from utils.multi_timeframe_state_builder import (
-    build_multi_timeframe_state
-)
-
-from risk.adaptive_trailing import (
-    AdaptiveTrailingEngine
-)
-
-from risk.profit_lock_engine import (
-    ProfitLockEngine
-)
-
-from market.regime_detector import (
-    MarketRegimeDetector
-)
+from utils.market_quality_analyzer import MarketQualityAnalyzer
+from risk.adaptive_trailing import AdaptiveTrailingEngine
+from risk.profit_lock_engine import ProfitLockEngine
+from market.regime_detector import MarketRegimeDetector
+from execution.trade_confidence import TradeConfidenceEngine
+from rl.environment.reward_engine import RewardEngine
+from rl.environment.portfolio_manager import PortfolioManager
+from rl.environment.state_manager import StateManager
+from rl.environment.metrics_manager import MetricsManager
+from rl.environment.regime_manager import RegimeManager
+from rl.environment.execution_manager import ExecutionManager
+from rl.environment.analysis_manager import AnalysisManager
 
 
 class PortfolioEnvironment:
+    """
+    Reinforcement‑learning environment that simulates a multi‑asset portfolio.
+    It wires together a collection of interchangeable "engine" components
+    (risk, execution, market analysis, etc.) and provides the classic
+    OpenAI‑Gym style API: ``reset()``, ``step(action)`` and ``get_metrics()``.
+    """
 
+    # ------------------------------------------------------------------
+    # Construction / configuration
+    # ------------------------------------------------------------------
     def __init__(
-
         self,
+        daily_data: Dict[str, Any],
+        hourly_data: Dict[str, Any],
+        five_data: Dict[str, Any],
+        initial_balance: float = 100_000,
+        max_positions: int = 5,
+        brokerage_per_trade: float = 40,
+        slippage_percent: float = 0.001,
+        position_size_percent: float = 0.20,
+    ) -> None:
+        """Initialise the environment.
 
-        daily_data,
-
-        hourly_data,
-
-        five_data,
-
-        initial_balance=100000,
-
-        max_positions=5,
-
-        brokerage_per_trade=40,
-
-        slippage_percent=0.001,
-
-        position_size_percent=0.20
-    ):
-
-        # ====================================
+        Parameters
+        ----------
+        daily_data, hourly_data, five_data
+            Mapping ``symbol -> pandas.DataFrame`` for the three time‑frames.
+        initial_balance
+            Starting cash balance.
+        max_positions
+            Maximum concurrent open positions.
+        brokerage_per_trade
+            Fixed cost charged on every executed trade.
+        slippage_percent
+            Fractional slippage applied to each trade price.
+        position_size_percent
+            Fraction of equity to allocate to a single position.
+        """
+        # --------------------------------------------------------------
         # DATA
-        # ====================================
-
+        # --------------------------------------------------------------
         self.daily_data = daily_data
-
         self.hourly_data = hourly_data
-
         self.five_data = five_data
+        # Keep only symbols that actually have data for the 5‑minute frame
+        self.stock_symbols = []  # will be populated with validated symbols
+        self.elite_filter = EliteOpportunityFilter()
+        self.elite_scoring = EliteScoring()
 
-        self.stock_symbols = list(
-            five_data.keys()
-        )
+        # Validate symbols – all three timeframes must contain at least one row
+        whitelist = set(get_allowed_symbols())
+        # Include any symbol that has complete data across all timeframes
+        for sym, df5 in five_data.items():
+            # Ensure dataframes are non-empty
+            if df5.empty:
+                continue
+            df_daily = daily_data.get(sym)
+            df_hourly = hourly_data.get(sym)
+            if df_daily is None or df_daily.empty:
+                continue
+            if df_hourly is None or df_hourly.empty:
+                continue
+            self.stock_symbols.append(sym)
+        if not self.stock_symbols:
+            raise ValueError("No symbols have complete data and are in the whitelist.")
 
-        # ====================================
+        # --------------------------------------------------------------
         # CONFIG
-        # ====================================
-
-        self.initial_balance = (
-            initial_balance
-        )
-
-        self.max_positions = (
-            max_positions
-        )
-
-        self.brokerage_per_trade = (
-            brokerage_per_trade
-        )
-
-        self.slippage_percent = (
-            slippage_percent
-        )
-
-        self.position_size_percent = (
-            position_size_percent
-        )
-
+        # --------------------------------------------------------------
+        self.initial_balance = initial_balance
+        self.max_positions = max_positions
+        self.brokerage_per_trade = brokerage_per_trade
+        self.slippage_percent = slippage_percent
+        self.position_size_percent = position_size_percent
         self.minimum_holding_steps = 20
 
-        # ====================================
-        # ENGINES
-        # ====================================
-
-        self.trade_validator = (
-            TradeValidator()
-        )
-
-        self.position_sizer = (
-            PositionSizer()
-        )
-
-        self.trade_confidence_engine = (
-            TradeConfidenceEngine()
-        )
-
-        self.market_quality_analyzer = (
-            MarketQualityAnalyzer()
-        )
-
+        # --------------------------------------------------------------
+        # CORE ENGINES
+        # --------------------------------------------------------------
+        self.trade_validator = TradeValidator()
+        self.position_sizer = PositionSizer()
+        self.trade_confidence_engine = TradeConfidenceEngine()
+        self.market_quality_analyzer = MarketQualityAnalyzer()
         self.risk_manager = RiskManager(
-
             stop_loss_percent=0.02,
-
             take_profit_percent=0.05,
-
             trailing_stop_percent=0.01,
+            max_hold_steps=200,
+        )
+        self.adaptive_trailing_engine = AdaptiveTrailingEngine()
+        self.profit_lock_engine = ProfitLockEngine()
+        self.market_regime_detector = MarketRegimeDetector()
 
-            max_hold_steps=200
+        # --------------------------------------------------------------
+        # RL ENGINES
+        # --------------------------------------------------------------
+        self.reward_engine = RewardEngine()
+        self.portfolio_manager = PortfolioManager(
+            initial_balance,
+            brokerage_per_trade,
+            slippage_percent,
+        )
+        self.state_manager = StateManager()
+        self.metrics_manager = MetricsManager()
+        self.regime_manager = RegimeManager(
+            self.market_regime_detector,
+            self.trade_confidence_engine,
+        )
+        self.execution_manager = ExecutionManager(
+            self.trade_validator,
+            self.position_sizer,
+            self.adaptive_trailing_engine,
+            self.profit_lock_engine,
+            self.risk_manager,
+            self.reward_engine,
+            self.portfolio_manager,
+        )
+        self.analysis_manager = AnalysisManager(
+            self.market_quality_analyzer,
+            self.regime_manager,
         )
 
-        self.adaptive_trailing_engine = (
-            AdaptiveTrailingEngine()
-        )
-
-        self.profit_lock_engine = (
-            ProfitLockEngine()
-        )
-
-        self.market_regime_detector = (
-            MarketRegimeDetector()
-        )
-
-        # ====================================
-        # RESET
-        # ====================================
-
+        # Initialise the environment state
         self.reset()
 
-    # ====================================
+    # ------------------------------------------------------------------
     # RESET
-    # ====================================
-
-    def reset(self):
-
-        self.balance = (
-            self.initial_balance
-        )
-
-        self.portfolio_value = (
-            self.initial_balance
-        )
-
-        self.positions = {}
-
+    # ------------------------------------------------------------------
+    def reset(self) -> Tuple[Any, ...]:
+        """Reset the episode to a fresh start and return the initial state."""
+        self.balance = self.initial_balance
+        self.portfolio_value = self.initial_balance
+        self.positions: Dict[str, Any] = {}
         self.trade_history = []
-
-        self.total_reward = 0
-
-        self.current_step = 50
-
+        self.total_reward = 0.0
+        # Start from the first index – the state builder expects at least one row
+        self.current_step = 0
         self.done = False
 
-        # ====================================
-        # RANDOM STOCK
-        # ====================================
+        # --------------------------------------------------------------
+        # RANDOM SYMBOL (guaranteed to have data)
+        # --------------------------------------------------------------
+        # Choose a symbol that satisfies elite scoring; retry a few times
+        max_tries = 10
+        for _ in range(max_tries):
+            candidate = random.choice(self.stock_symbols)
+            df5 = self.five_data[candidate]
+            # Compute recent relative volume (simple proxy)
+            recent_vol = df5["volume"].iloc[-20:].mean() if len(df5) >= 20 else df5["volume"].mean()
+            rel_vol = df5["volume"].iloc[-1] / (recent_vol + 1e-9)
+            # Use the most recent row for scoring
+            row = df5.iloc[-1]
+            if self.elite_scoring.is_elite(row, rel_vol):
+                self.current_symbol = candidate
+                break
+        else:
+            # Fallback to random if no elite found
+            self.current_symbol = random.choice(self.stock_symbols)
 
-        self.current_symbol = random.choice(
+        # Grab the pre‑validated DataFrames (they are guaranteed non‑empty)
+        self.daily_df = self.daily_data[self.current_symbol].reset_index(drop=True)
+        self.hourly_df = self.hourly_data[self.current_symbol].reset_index(drop=True)
+        self.five_df = self.five_data[self.current_symbol].reset_index(drop=True)
 
-            self.stock_symbols
-        )
-
-        self.daily_df = self.daily_data[
-            self.current_symbol
-        ].reset_index(drop=True)
-
-        self.hourly_df = self.hourly_data[
-            self.current_symbol
-        ].reset_index(drop=True)
-
-        self.five_df = self.five_data[
-            self.current_symbol
-        ].reset_index(drop=True)
+        # Defensive sanity check (should never trigger because of validation above)
+        if self.five_df.empty or self.daily_df.empty or self.hourly_df.empty:
+            raise ValueError(
+                f"One of the data frames for symbol {self.current_symbol} is empty after validation."
+            )
 
         return self._get_state()
 
-    # ====================================
-    # GET STATE
-    # ====================================
-
-    def _get_state(self):
-
-        daily_index = min(
-
-            len(self.daily_df) - 1,
-
-            max(50, self.current_step // 75)
+    # ------------------------------------------------------------------
+    # STATE BUILDING
+    # ------------------------------------------------------------------
+    def _get_state(self) -> Tuple[Any, ...]:
+        """Delegate to the StateManager to construct the observation."""
+        return self.state_manager.build_state(
+            self.daily_df,
+            self.hourly_df,
+            self.five_df,
+            self.current_step,
+            self.balance,
+            self.initial_balance,
+            self.positions,
+            self.max_positions,
+            self.portfolio_value,
         )
 
-        hourly_index = min(
-
-            len(self.hourly_df) - 1,
-
-            max(50, self.current_step // 12)
-        )
-
-        five_index = min(
-
-            len(self.five_df) - 1,
-
-            self.current_step
-        )
-
-        daily_window = self.daily_df.iloc[
-            :daily_index
-        ]
-
-        hourly_window = self.hourly_df.iloc[
-            :hourly_index
-        ]
-
-        five_window = self.five_df.iloc[
-            :five_index
-        ]
-
-        portfolio_features = np.array([
-
-            self.balance / self.initial_balance,
-
-            len(self.positions)
-            / self.max_positions,
-
-            self.portfolio_value
-            / self.initial_balance
-        ])
-
-        state = build_multi_timeframe_state(
-
-            daily_window,
-
-            hourly_window,
-
-            five_window,
-
-            portfolio_features
-        )
-
-        return state.astype(np.float32)
-
-    # ====================================
+    # ------------------------------------------------------------------
     # STEP
-    # ====================================
+    # ------------------------------------------------------------------
+    def step(self, action: int) -> Tuple[Tuple[Any, ...], float, bool, Dict]:
+        """Execute one environment step.
 
-    def step(self, action):
+        Parameters
+        ----------
+        action : int
+            0 = Hold, 1 = Buy, 2 = Sell
 
-        reward = 0
-
+        Returns
+        -------
+        next_state, reward, done, info
+        """
+        reward = 0.0
         symbol = self.current_symbol
+        current_row = self.five_df.iloc[self.current_step]
 
-        current_row = self.five_df.iloc[
-            self.current_step
-        ]
-
-        current_price = current_row["close"]
-
-        atr = current_row["ATR"]
-
-        rsi = current_row["RSI"]
-
-        # ====================================
+        # --------------------------------------------------------------
         # MARKET ANALYSIS
-        # ====================================
+        # --------------------------------------------------------------
+        analysis_data = self.analysis_manager.analyze(self, current_row)
 
-        analysis = (
+        analysis = analysis_data["analysis"]
+        confidence = analysis_data["confidence"]
+        regime = analysis_data["regime"]
+        bullish_alignment = analysis_data["bullish_alignment"]
+        volatility_ratio = analysis_data["volatility_ratio"]
+        current_price = analysis_data["current_price"]
+        atr = analysis_data["atr"]
 
-            self.market_quality_analyzer
-            .analyze(
-
-                self.daily_df.iloc[
-                    :max(50, self.current_step // 75)
-                ],
-
-                self.hourly_df.iloc[
-                    :max(50, self.current_step // 12)
-                ],
-
-                self.five_df.iloc[
-                    :self.current_step
-                ]
-            )
+        # --------------------------------------------------------------
+        # AUTO‑EXIT (e.g., stop‑loss, take‑profit)
+        # --------------------------------------------------------------
+        reward += self.execution_manager.handle_auto_exit(
+            self,
+            symbol,
+            current_price,
+            atr,
+            confidence,
+            analysis,
         )
 
-        bullish_alignment = (
-
-            self.daily_df.iloc[
-                max(0, self.current_step // 75)
-            ]["EMA20"]
-
-            >
-
-            self.daily_df.iloc[
-                max(0, self.current_step // 75)
-            ]["EMA50"]
+        # --------------------------------------------------------------
+        # ELITE OPPORTUNITY FILTER
+        # --------------------------------------------------------------
+        recent_volume_mean = (
+            self.five_df["volume"]
+            .iloc[max(0, self.current_step - 20) : self.current_step]
+            .mean()
         )
+        relative_volume = current_row["volume"] / (recent_volume_mean + 1e-9)
 
-        volatility_ratio = (
-            atr / current_price
+        elite_setup = self.elite_filter.is_valid_setup(
+            current_row,
+            relative_volume,
         )
+        # if not elite_setup:
+        #     action = 0  # force HOLD if the setup is not elite
+        # (Removed forced HOLD to allow trading actions)
 
-        confidence = (
-
-            self.trade_confidence_engine
-            .calculate(
-
-                analysis["quality_score"],
-
-                rsi,
-
-                bullish_alignment,
-
-                volatility_ratio
-            )
-        )
-
-        regime = (
-
-            self.market_regime_detector
-            .detect(
-
-                current_price,
-
-                current_row["EMA20"],
-
-                current_row["EMA50"],
-
-                volatility_ratio
-            )
-        )
-
-        # ====================================
-        # REGIME FILTER
-        # ====================================
-
-        if regime == "trending":
-
-            confidence += 0.10
-
-        elif regime == "volatile":
-
-            confidence -= 0.10
-
-        elif regime == "choppy":
-
-            confidence -= 0.15
-
-        # ====================================
-        # AUTO EXIT
-        # ====================================
-
-        if symbol in self.positions:
-
-            position = self.positions[symbol]
-
-            position["highest_price"] = max(
-
-                position["highest_price"],
-
-                current_price
-            )
-
-            adaptive_stop = (
-
-                self.adaptive_trailing_engine
-                .calculate(
-
-                    position["entry_price"],
-
-                    current_price,
-
-                    atr,
-
-                    confidence,
-
-                    analysis["quality_score"]
-                )
-            )
-
-            locked_stop = (
-
-                self.profit_lock_engine
-                .calculate(
-
-                    position["entry_price"],
-
-                    current_price
-                )
-            )
-
-            final_stop = max(
-
-                adaptive_stop,
-
-                locked_stop
-            )
-
-            risk_exit = None
-
-            if current_price < final_stop:
-
-                risk_exit = (
-                    "adaptive_trailing"
-                )
-
-            else:
-
-                risk_exit = (
-
-                    self.risk_manager
-                    .check_exit(
-
-                        position,
-
-                        current_price,
-
-                        self.current_step
-                    )
-                )
-
-            if risk_exit is not None:
-
-                pnl = self._close_position(
-
-                    symbol,
-
-                    current_price,
-
-                    risk_exit
-                )
-
-                reward += pnl / 3000
-
-                if pnl > 0:
-
-                    reward += pnl / 1000
-
-                else:
-
-                    reward -= abs(
-                        pnl / 2000
-                    )
-
-                action = 0
-
-        # ====================================
+        # --------------------------------------------------------------
         # BUY
-        # ====================================
-
+        # --------------------------------------------------------------
         if action == 1:
-
-            valid_trade = (
-
-                self.trade_validator
-                .validate_buy(
-
-                    self.daily_df.iloc[
-                        :max(
-                            50,
-                            self.current_step // 75
-                        )
-                    ],
-
-                    self.hourly_df.iloc[
-                        :max(
-                            50,
-                            self.current_step // 12
-                        )
-                    ],
-
-                    self.five_df.iloc[
-                        :self.current_step
-                    ]
-                )
+                        reward += self.execution_manager.execute_buy(
+                self,
+                symbol,
+                current_price,
+                confidence,
+                analysis,
+                volatility_ratio,
+                bullish_alignment,
+                regime,
             )
 
-            if (
-
-                valid_trade
-
-                and
-
-                confidence > 0.40
-
-                and
-
-                symbol not in self.positions
-
-                and
-
-                len(self.positions)
-                < self.max_positions
-            ):
-
-                dynamic_position_size = (
-
-                    self.position_sizer
-                    .calculate(
-
-                        analysis[
-                            "quality_score"
-                        ],
-
-                        volatility_ratio,
-
-                        bullish_alignment
-                    )
-                )
-
-                dynamic_position_size *= (
-                    0.5 + confidence
-                )
-
-                allocation = (
-
-                    self.balance
-
-                    *
-
-                    dynamic_position_size
-                )
-
-                if allocation > 1000:
-
-                    shares = (
-                        allocation
-                        / current_price
-                    )
-
-                    buy_cost = (
-
-                        allocation
-
-                        +
-
-                        self.brokerage_per_trade
-                    )
-
-                    buy_cost *= (
-                        1 + self.slippage_percent
-                    )
-
-                    if buy_cost <= self.balance:
-
-                        self.balance -= buy_cost
-
-                        self.positions[symbol] = {
-
-                            "entry_price":
-                            current_price,
-
-                            "shares":
-                            shares,
-
-                            "remaining_shares":
-                            shares,
-
-                            "entry_step":
-                            self.current_step,
-
-                            "highest_price":
-                            current_price,
-
-                            "partial_exit_done":
-                            False
-                        }
-
-                        reward -= 0.02
-
-        # ====================================
-        # MANUAL SELL
-        # ====================================
-
+        # --------------------------------------------------------------
+        # SELL
+        # --------------------------------------------------------------
         elif action == 2:
+            reward += self.execution_manager.execute_sell(
+                self,
+                symbol,
+                current_price,
+                analysis,
+            )
 
-            if symbol in self.positions:
-
-                position = self.positions[
-                    symbol
-                ]
-
-                holding_period = (
-
-                    self.current_step
-
-                    -
-
-                    position["entry_step"]
-                )
-
-                if (
-
-                    holding_period
-
-                    >=
-
-                    self.minimum_holding_steps
-                ):
-
-                    pnl = self._close_position(
-
-                        symbol,
-
-                        current_price,
-
-                        "RL_SELL"
-                    )
-
-                    reward += pnl / 3000
-
-                    if pnl > 0:
-
-                        reward += pnl / 1000
-
-                        if holding_period > 50:
-
-                            reward += 2
-
-                        elif holding_period > 20:
-
-                            reward += 1
-
-                    else:
-
-                        reward -= abs(
-                            pnl / 2000
-                        )
-
-                    reward += confidence
-
-        # ====================================
-        # PORTFOLIO VALUE
-        # ====================================
-
+        # --------------------------------------------------------------
+        # UPDATE PORTFOLIO
+        # --------------------------------------------------------------
         self._update_portfolio_value()
 
-        # ====================================
-        # DRAWDOWN CONTROL
-        # ====================================
-
+        # --------------------------------------------------------------
+        # DRAWDOWN PENALTIES
+        # --------------------------------------------------------------
         portfolio_drawdown = (
-
-            self.initial_balance
-
-            -
-
-            self.portfolio_value
+            self.initial_balance - self.portfolio_value
         ) / self.initial_balance
-
         if portfolio_drawdown > 0.05:
-
             reward -= 1
-
         if portfolio_drawdown > 0.10:
-
             reward -= 3
-
         if portfolio_drawdown > 0.15:
-
             reward -= 8
-
         if portfolio_drawdown > 0.20:
-
             reward -= 15
 
-        # ====================================
-        # NEXT STEP
-        # ====================================
-
+        # --------------------------------------------------------------
+        # NEXT STEP / TERMINATION
+        # --------------------------------------------------------------
         self.current_step += 1
-
-        if (
-
-            self.current_step
-
-            >=
-
-            len(self.five_df) - 1
-        ):
-
+        if self.current_step >= len(self.five_df) - 1:
             self.done = True
 
         self.total_reward += reward
-
         next_state = self._get_state()
 
-        return (
-
-            next_state,
-
-            reward,
-
-            self.done,
-
-            {}
-        )
-
-    # ====================================
-    # CLOSE POSITION
-    # ====================================
-
-    def _close_position(
-
-        self,
-
-        symbol,
-
-        current_price,
-
-        exit_reason
-    ):
-
-        position = self.positions[
-            symbol
-        ]
-
-        shares = position[
-            "remaining_shares"
-        ]
-
-        sell_value = (
-
-            shares
-
-            *
-
-            current_price
-        )
-
-        sell_value -= (
-            self.brokerage_per_trade
-        )
-
-        sell_value *= (
-            1 - self.slippage_percent
-        )
-
-        pnl = sell_value - (
-
-            shares
-
-            *
-
-            position["entry_price"]
-        )
-
-        self.balance += sell_value
-
-        self.trade_history.append({
-
-            "symbol": symbol,
-
-            "entry_price":
-            position["entry_price"],
-
-            "exit_price":
-            current_price,
-
-            "pnl": pnl,
-
-            "holding_period": (
-
-                self.current_step
-
-                -
-
-                position["entry_step"]
-            ),
-
-            "exit_reason":
-            exit_reason
-        })
-
-        del self.positions[symbol]
-
-        return pnl
-
-    # ====================================
-    # PORTFOLIO VALUE
-    # ====================================
-
-    def _update_portfolio_value(self):
-
-        positions_value = 0
-
-        for symbol, position in self.positions.items():
-
-            latest_price = self.five_data[
-                symbol
-            ].iloc[
-                min(
-
-                    self.current_step,
-
-                    len(
-                        self.five_data[symbol]
-                    ) - 1
-                )
-            ]["close"]
-
-            positions_value += (
-
-                position["remaining_shares"]
-
-                *
-
-                latest_price
-            )
-
-        self.portfolio_value = (
-
-            self.balance
-
-            +
-
-            positions_value
-        )
-
-    # ====================================
-    # METRICS
-    # ====================================
-
-    def get_metrics(self):
-
-        total_pnl = (
-
-            self.portfolio_value
-
-            -
-
-            self.initial_balance
-        )
-
-        wins = [
-
-            t for t in self.trade_history
-
-            if t["pnl"] > 0
-        ]
-
-        win_rate = 0
-
-        if len(self.trade_history) > 0:
-
-            win_rate = (
-
-                len(wins)
-
-                /
-
-                len(self.trade_history)
-            ) * 100
-
-        return {
-
-            "portfolio_value":
-            self.portfolio_value,
-
-            "balance":
+        return next_state, reward, self.done, {}
+
+    # ------------------------------------------------------------------
+    # PORTFOLIO VALUE CALCULATION
+    # ------------------------------------------------------------------
+    def _update_portfolio_value(self) -> None:
+        """Re‑calculate the total equity based on current holdings."""
+        self.portfolio_value = self.portfolio_manager.calculate_portfolio_value(
             self.balance,
+            self.positions,
+            self.five_data,
+            self.current_step,
+        )
 
-            "pnl":
-            total_pnl,
-
-            "trades":
-            len(self.trade_history),
-
-            "win_rate":
-            win_rate,
-
-            "open_positions":
-            len(self.positions)
-        }
+    # ------------------------------------------------------------------
+    # METRICS
+    # ------------------------------------------------------------------
+    def get_metrics(self) -> Tuple[Any, ...]:
+        """Return a tuple of performance metrics for the episode."""
+        return self.metrics_manager.calculate_metrics(
+            self.portfolio_value,
+            self.initial_balance,
+            self.balance,
+            self.trade_history,
+            self.positions,
+        )

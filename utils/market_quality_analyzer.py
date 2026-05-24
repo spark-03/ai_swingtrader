@@ -22,6 +22,9 @@ class MarketQualityAnalyzer:
         five_df
     ):
 
+        # Guard against empty dataframes – if any timeframe lacks data, return a neutral score.
+        if daily_df.empty or hourly_df.empty or five_df.empty:
+            return {"quality_score": 0.0, "tradable": False}
         daily = daily_df.iloc[-1]
 
         hourly = hourly_df.iloc[-1]

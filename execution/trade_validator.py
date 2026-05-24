@@ -19,6 +19,8 @@ class TradeValidator:
         five_df
     ):
 
+        if daily_df.empty or hourly_df.empty or five_df.empty:
+            return False
         daily = daily_df.iloc[-1]
 
         hourly = hourly_df.iloc[-1]

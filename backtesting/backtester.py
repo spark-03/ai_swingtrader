@@ -22,22 +22,19 @@ def run_backtest(df):
         signal_data = generate_signal(current_df)
 
         signal = signal_data["signal"]
+        # Detect market regime first so confidence can be regime-aware.
+        regime = detect_market_regime(current_df)
         # Confidence score
-        confidence = calculate_confidence(
-    current_df
-)       
+        confidence = calculate_confidence(current_df, regime=regime)
         # Skip weak setups
         if confidence < 75:
-
-         continue
-        # Detect market regime
-        regime = detect_market_regime(current_df)
+            continue
         # Position sizing
         capital = calculate_position_size(regime)
         
         # Skip sideways markets
         if regime == "SIDEWAYS":
-         continue
+            continue
 
         # Skip HOLD trades
         if signal == "HOLD":

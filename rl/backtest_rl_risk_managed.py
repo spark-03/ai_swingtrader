@@ -1,8 +1,20 @@
+import argparse
 import os
-
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 import torch
 import pandas as pd
 import numpy as np
+
+# Argument parser for dynamic data folder and checkpoint
+parser = argparse.ArgumentParser(description='Risk-managed RL backtest')
+parser.add_argument('--data', type=str, default='data/features/5min', help='Path to parquet data folder')
+parser.add_argument('--checkpoint', type=str, default='multi_stock_dqn.pth', help='Path to model checkpoint')
+parser.add_argument('--symbol', type=str, default='', help='Symbol name for logging')
+args = parser.parse_args()
+
+# Use provided data folder
+DATA_FOLDER = args.data
 
 from rl.dqn_model import DQN
 from utils.state_builder import build_state
@@ -12,7 +24,7 @@ from utils.state_builder import build_state
 # SETTINGS
 # ====================================
 
-DATA_FOLDER = "historical_data_indicators"
+DATA_FOLDER = "data/features/5min"
 
 INITIAL_BALANCE = 100000
 
@@ -61,7 +73,7 @@ sample_df = pd.read_parquet(
     )
 )
 
-sample_state = build_state(sample_df)
+sample_state = build_state(sample_df, position_flag=0, hold_candles=0)
 
 state_size = len(sample_state)
 
@@ -72,12 +84,8 @@ model = DQN(
     action_size=3
 )
 
-model.load_state_dict(
-
-    torch.load(
-        "multi_stock_dqn.pth"
-    )
-)
+model_path = args.checkpoint
+model.load_state_dict(torch.load(model_path))
 
 model.eval()
 
@@ -125,6 +133,10 @@ for file_name in files:
         df = df.reset_index(drop=True)
 
         balance = INITIAL_BALANCE
+        # Instantiate RiskEngine once for the backtest
+        risk_engine = RiskEngine(stop_loss=STOP_LOSS, take_profit=TAKE_PROFIT, trailing_stop=TRAILING_STOP)
+        # Track portfolio for step‑wise reward
+        prev_portfolio = INITIAL_BALANCE
 
         position = None
 
@@ -152,7 +164,10 @@ for file_name in files:
 
             current_df = df.iloc[:i+1]
 
-            state = build_state(current_df)
+            state = build_state(current_df, position_flag=1 if position else 0, hold_candles=hold_candles)
+            # Validate state vector length and sanity
+            from utils.state_builder import validate_state
+            validate_state(state, expected_len=21)
 
             state_tensor = torch.FloatTensor(
 
@@ -185,23 +200,17 @@ for file_name in files:
             # ====================================
 
             if confidence < CONFIDENCE_THRESHOLD:
-
+                # Low confidence: skip opening new positions, but keep existing position risk checks.
+                low_confidence = True
                 skipped_signals += 1
-
-                continue
+            else:
+                low_confidence = False
 
             # ====================================
             # BUY LOGIC
             # ====================================
 
-            if (
-
-                signal == "BUY"
-
-                and position is None
-
-                and cooldown == 0
-            ):
+            if (signal == "BUY" and position is None and cooldown == 0 and not low_confidence):
 
                 position = "LONG"
 
@@ -246,24 +255,14 @@ for file_name in files:
                 # STOP LOSS
                 # ====================================
 
-                stop_loss_hit = pnl_pct <= -STOP_LOSS
+                stop_loss_hit, take_profit_hit, trailing_stop_hit = risk_engine.evaluate(pnl_pct, trailing_drawdown, hold_candles)
 
                 # ====================================
                 # TAKE PROFIT
                 # ====================================
 
-                take_profit_hit = pnl_pct >= TAKE_PROFIT
+                # NOTE: take_profit_hit and trailing_stop_hit are provided by RiskEngine
 
-                # ====================================
-                # TRAILING STOP
-                # ====================================
-
-                trailing_stop_hit = (
-
-                    pnl_pct > 0
-
-                    and trailing_drawdown >= TRAILING_STOP
-                )
 
                 # ====================================
                 # RL EXIT
@@ -290,19 +289,18 @@ for file_name in files:
                 # ====================================
 
                 if (
-
-                    stop_loss_hit
-
-                    or take_profit_hit
-
-                    or trailing_stop_hit
-
-                    or rl_exit
-
-                    or max_hold_exit
-                ):
+                     stop_loss_hit
+                     or take_profit_hit
+                     or trailing_stop_hit
+                     or rl_exit
+                     or max_hold_exit
+                 ):
 
                     pnl = TRADE_SIZE * pnl_pct
+                    # Step‑wise reward based on portfolio change
+                    current_portfolio = balance + (TRADE_SIZE * pnl_pct if position == "LONG" else 0)
+                    step_reward = current_portfolio - prev_portfolio
+                    prev_portfolio = current_portfolio
 
                     balance += pnl
 

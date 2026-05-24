@@ -1,0 +1,26 @@
+TRAINING_SYMBOLS = [
+
+    "SBIN-EQ",
+    "RELIANCE-EQ",
+    "BEL-EQ",
+    "BHARTIARTL-EQ",
+    "TATASTEEL-EQ",
+
+    "HINDALCO-EQ",
+    "NTPC-EQ",
+    "PNB-EQ",
+    "FEDERALBNK-EQ",
+    "POWERGRID-EQ",
+
+    "RBLBANK-EQ",
+    "BIOCON-EQ",
+    "LAURUSLABS-EQ",
+    "TATAPOWER-EQ",
+    "IDFCFIRSTB-EQ",
+
+    "SAIL-EQ",
+    "ABCAPITAL-EQ",
+    "INDUSTOWER-EQ",
+    "NMDC-EQ",
+    "COALINDIA-EQ"
+]
