@@ -1,6 +1,8 @@
 from strategy.indicators import add_indicators
 from strategy.signal_engine import generate_signal
-from paper_trading.exit_manager import manage_exit
+from paper_trading.experimental_exit_manager import (
+    manage_exit
+)
 from strategy.market_regime import detect_market_regime
 from risk.position_sizer import calculate_position_size
 from strategy.confidence_score import calculate_confidence
