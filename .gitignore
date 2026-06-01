@@ -27,3 +27,70 @@ logs/
 
 # Jupyter
 .ipynb_checkpoints/
+# Virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Research outputs
+data/research/
+data/states/
+data/sequence/
+data/regimes/
+data/labeled/
+data/rl/
+
+# Large datasets
+*.parquet
+*.npy
+*.npz
+*.h5
+*.feather
+
+# Models
+models/*.pkl
+models/*.zip
+models/*.pth
+
+# Runtime files
+current_portfolio.csv
+temp_portfolio.txt
+
+# Generated rankings
+logs/pqs_rankings/
+
+# Angel instrument cache
+data/instruments.json
+
+# Analysis scratch work
+analysis/temp/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Render cache
+.render/
+
+# Temporary
+tmp/
+temp/
