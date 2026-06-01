@@ -1,0 +1,39 @@
+name: paper-trader
+
+on:
+  push:
+    branches:
+      - "**"
+  schedule:
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+
+jobs:
+  lint-smoke-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy pyarrow requests streamlit stable-baselines3
+
+      - name: Lint (compile check)
+        run: |
+          python -m compileall paper_trading dashboard
+
+      - name: Smoke tests
+        run: |
+          python -m paper_trading.smoke_test
+
+      - name: Run live cycle (dry-run)
+        run: |
+          python -m paper_trading.run_live_portfolio --dry-run
