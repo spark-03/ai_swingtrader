@@ -28,9 +28,12 @@ from paper_trading.data_utils import (
     merge_with_existing_and_trim,
     save_symbol_2h_parquet,
 )
+from paper_trading.data_validator import validate_parquet_file
+from paper_trading.logging_config import get_system_logger
 
 
 THREAD_CTX = local()
+LOGGER = get_system_logger("paper_trading.data_update")
 BATCH_SIZE = 10
 BATCH_SLEEP_SECONDS = 10
 RETRY_BACKOFF_SECONDS = (5, 10, 20)
@@ -122,8 +125,22 @@ def _process_symbol_once(
     if merged.empty:
         return UpdateResult(now, symbol, 0, 0.0, "FAILED", "No completed 2H bars")
 
-    save_symbol_2h_parquet(symbol, merged)
+    if merged["datetime"].isna().any():
+        return UpdateResult(now, symbol, 0, 0.0, "FAILED", "Null timestamps after merge")
+    if merged["datetime"].duplicated().any():
+        return UpdateResult(now, symbol, 0, 0.0, "FAILED", "Duplicate timestamps after merge")
+    if not merged["datetime"].is_monotonic_increasing:
+        return UpdateResult(now, symbol, 0, 0.0, "FAILED", "Timestamps not ascending after merge")
+    if len(merged) < 30:
+        return UpdateResult(now, symbol, 0, 0.0, "FAILED", "Insufficient rolling 2H window")
+
+    saved_file = save_symbol_2h_parquet(symbol, merged)
+    validation = validate_parquet_file(saved_file)
+    if validation.status == "FAIL":
+        return UpdateResult(now, symbol, 0, 0.0, "FAILED", validation.error)
+
     latest_close = float(merged["close"].iloc[-1])
+    LOGGER.info("Data update saved symbol=%s bars=%s latest_close=%s", symbol, len(merged), latest_close)
     return UpdateResult(now, symbol, int(len(merged)), latest_close, "SUCCESS", "")
 
 
@@ -166,23 +183,10 @@ def run_update() -> None:
 
     print("Loading universe...", flush=True)
     universe = load_nifty500_universe()
-    from pathlib import Path
-
-    existing_symbols = {
-    p.stem
-    for p in Path(
-        "data/live/2h"
-    ).glob("*.parquet")
-}
-    universe = [
-    s
-    for s in universe
-    if s not in existing_symbols
-]
 
     print(
-    f"Remaining Symbols: {len(universe)}"
-)
+        f"Symbols to update incrementally: {len(universe)}"
+    )
 
     print("Loading token cache...", flush=True)
 
@@ -431,6 +435,13 @@ def run_update() -> None:
 
     print(
         f"Runtime: {runtime:.2f} seconds"
+    )
+    LOGGER.info(
+        "Data update complete universe=%s successful=%s failed=%s runtime_seconds=%.2f",
+        len(universe),
+        counter.success,
+        counter.failed,
+        runtime,
     )
 
     print(

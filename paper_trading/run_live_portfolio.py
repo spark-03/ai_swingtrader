@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
+import time
 
 import pandas as pd
 
 from paper_trading.live_candidate_engine import LiveCandidateEngine
+from paper_trading.logging_config import get_system_logger
+from paper_trading.metrics import record_cycle_error, record_cycle_start, update_cycle_metrics
 from paper_trading.portfolio_engine import PortfolioEngine
 from paper_trading.rl_exit_engine import RLExitEngine
 from paper_trading.rotation_engine import RotationEngine
+from paper_trading.state_manager import StateManager
 from paper_trading.supabase_logger import SupabaseLogger
 
 
@@ -19,30 +22,23 @@ def fetch_latest_market_data() -> None:
 
 
 def apply_rl_exits(portfolio_df: pd.DataFrame, decisions_df: pd.DataFrame) -> pd.DataFrame:
-    print("portfolio_df.dtypes (before apply_rl_exits):")
-    print(portfolio_df.dtypes)
-
     if portfolio_df.empty or decisions_df.empty:
         return portfolio_df
-
-    portfolio_df = portfolio_df.copy()
     if "exit_timestamp" not in portfolio_df.columns:
-        portfolio_df["exit_timestamp"] = pd.NaT
+        portfolio_df["exit_timestamp"] = pd.Series(dtype="object")
 
-    portfolio_df["exit_timestamp"] = pd.to_datetime(
-        portfolio_df["exit_timestamp"],
-        utc=True,
-        errors="coerce",
-    )
+    if "close_reason" not in portfolio_df.columns:
+        portfolio_df["close_reason"] = pd.Series(dtype="object")
+
+    portfolio_df["exit_timestamp"] = portfolio_df["exit_timestamp"].astype("object")
+    portfolio_df["close_reason"] = portfolio_df["close_reason"].astype("object")
 
     sells = set(decisions_df[decisions_df["decision"] == "SELL"]["symbol"].tolist())
     mask = (portfolio_df["status"] == "OPEN") & (portfolio_df["symbol"].isin(sells))
+    
     portfolio_df.loc[mask, "status"] = "CLOSED_RL"
     portfolio_df.loc[mask, "close_reason"] = "rl_exit"
-    portfolio_df.loc[mask, "exit_timestamp"] = pd.Timestamp.now("UTC")
-
-    print('portfolio_df[["symbol","exit_timestamp"]].dtypes:')
-    print(portfolio_df[["symbol", "exit_timestamp"]].dtypes)
+    portfolio_df.loc[mask, "exit_timestamp"] = pd.Timestamp.now("UTC").floor("s")
 
     return portfolio_df
 
@@ -66,62 +62,192 @@ def build_snapshot(portfolio_df: pd.DataFrame) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run live paper trading cycle.")
     parser.add_argument("--dry-run", action="store_true", help="Skip Supabase writes.")
+    parser.add_argument("--slot", default=None, help="Processed candle slot in YYYY-MM-DD HH format.")
     args = parser.parse_args()
+    logger = get_system_logger("paper_trading.live_cycle")
+    state_manager = StateManager()
+    cycle_started = time.monotonic()
+    record_cycle_start()
+    logger.info("Cycle start slot=%s dry_run=%s", args.slot, args.dry_run)
+    
+    try:
+        fetch_latest_market_data()
 
-    fetch_latest_market_data()
+        candidate_engine = LiveCandidateEngine()
+        candidates = candidate_engine.generate_candidates()
+        
+        # Upload Top 100 PQS rankings to Supabase
+        if not args.dry_run:
+            supabase_logger = SupabaseLogger()
 
-    candidate_engine = LiveCandidateEngine()
-    candidates = candidate_engine.generate_candidates()
-
-    portfolio_engine = PortfolioEngine()
-    portfolio = portfolio_engine.update_from_candidates(candidates)
-    open_positions = portfolio[portfolio["status"] == "OPEN"].copy() if not portfolio.empty else pd.DataFrame()
-
-    rl_engine = RLExitEngine()
-    exit_decisions = rl_engine.decide(open_positions, candidates)
-    portfolio = apply_rl_exits(portfolio, exit_decisions)
-
-    open_positions = portfolio[portfolio["status"] == "OPEN"].copy() if not portfolio.empty else pd.DataFrame()
-    free_slots = max(0, 3 - len(open_positions))
-    buy_decisions = rl_engine.candidate_entries(open_positions, candidates, free_slots)
-
-    rotation_engine = RotationEngine()
-    portfolio, rotation_log = rotation_engine.evaluate_and_rotate(portfolio, candidates)
-    portfolio.to_csv(Path("current_portfolio.csv"), index=False)
-
-    snapshot = build_snapshot(portfolio)
-
-    if not args.dry_run:
-        logger = SupabaseLogger()
-        trade_rows = []
-        now = pd.Timestamp.now("UTC").isoformat()
-        for _, r in pd.concat([exit_decisions, buy_decisions], ignore_index=True).iterrows():
-            trade_rows.append(
-                {
-                    "timestamp": now,
-                    "symbol": str(r["symbol"]),
-                    "action": str(r["decision"]),
-                    "price": 0.0,
-                    "quantity": 0,
-                    "tqs": 0.0,
-                    "reason": str(r["reason"]),
-                }
+            # Clear previous rankings
+            resp = supabase_logger.session.delete(
+                f"{supabase_logger.config.url}/rest/v1/pqs_rankings?id=gt.0"
             )
-        logger.log_paper_trades(trade_rows)
-        logger.log_portfolio_snapshots([snapshot])
-        if not rotation_log.empty:
-            rows = []
-            for _, row in rotation_log.iterrows():
-                rows.append(
+            resp.raise_for_status()
+
+            top_rankings = (
+                candidates
+                .sort_values("pqs", ascending=False)
+                .head(100)
+            )
+
+            ranking_rows = []
+
+            for idx, row in top_rankings.reset_index(drop=True).iterrows():
+                ranking_rows.append(
                     {
-                        "timestamp": pd.Timestamp(row["timestamp"]).isoformat(),
-                        "old_symbol": str(row["old_symbol"]),
-                        "new_symbol": str(row["new_symbol"]),
-                        "old_tqs": float(row["old_tqs"]),
-                        "new_tqs": float(row["new_tqs"]),
+                        "timestamp": pd.Timestamp.now("UTC").isoformat(),
+                        "rank": idx + 1,
+                        "symbol": str(row["symbol"]),
+                        "pqs": float(row["pqs"]),
+                        "last_price": float(row.get("last_price", 0.0)),
                     }
                 )
-            logger.log_rotation(rows)
+
+            supabase_logger.log_pqs_rankings(ranking_rows)
+        
+        portfolio_engine = PortfolioEngine()
+        portfolio = portfolio_engine.update_from_candidates(candidates)
+        open_positions = portfolio[portfolio["status"] == "OPEN"].copy() if not portfolio.empty else pd.DataFrame()
+
+        rl_engine = RLExitEngine()
+        exit_decisions = rl_engine.decide(open_positions, candidates)
+        portfolio = apply_rl_exits(portfolio, exit_decisions)
+
+        open_positions = portfolio[portfolio["status"] == "OPEN"].copy() if not portfolio.empty else pd.DataFrame()
+        free_slots = max(0, 3 - len(open_positions))
+        buy_decisions = rl_engine.candidate_entries(open_positions, candidates, free_slots)
+
+        rotation_engine = RotationEngine()
+        portfolio, rotation_log = rotation_engine.evaluate_and_rotate(portfolio, candidates)
+        state_manager.save_portfolio(portfolio)
+        
+        if not args.dry_run:
+            supabase_logger = SupabaseLogger()
+
+            resp = supabase_logger.session.delete(
+                f"{supabase_logger.config.url}/rest/v1/open_positions?id=gt.0"
+            )
+            resp.raise_for_status()
+
+            candidate_prices = (
+                candidates[["symbol", "last_price"]]
+                .drop_duplicates(subset=["symbol"])
+                .set_index("symbol")["last_price"]
+                .to_dict()
+            )
+
+            open_positions_rows = []
+
+            for _, row in portfolio[portfolio["status"] == "OPEN"].iterrows():
+                symbol = str(row["symbol"])
+
+                current_price = float(
+                    candidate_prices.get(
+                        symbol,
+                        row["entry_price"]
+                    )
+                )
+
+                entry_price = float(row["entry_price"])
+                quantity = int(row["quantity"])
+
+                cost_basis = entry_price * quantity
+                market_value = current_price * quantity
+
+                unrealized_pnl = market_value - cost_basis
+
+                unrealized_pnl_pct = (
+                    (unrealized_pnl / cost_basis) * 100
+                    if cost_basis > 0
+                    else 0.0
+                )
+
+                open_positions_rows.append(
+                    {
+                        "timestamp": pd.Timestamp.now("UTC").isoformat(),
+                        "symbol": symbol,
+                        "entry_timestamp": pd.Timestamp(
+                            row["entry_timestamp"]
+                        ).isoformat(),
+                        "entry_price": entry_price,
+                        "quantity": quantity,
+                        "slot_id": int(row["slot_id"]),
+                        "slot_capital": float(row["slot_capital"]),
+                        "pqs": float(row["pqs"]),
+                        "status": str(row["status"]),
+                        "current_price": current_price,
+                        "market_value": market_value,
+                        "unrealized_pnl": unrealized_pnl,
+                        "unrealized_pnl_pct": unrealized_pnl_pct,
+                    }
+                )
+
+            supabase_logger.log_open_positions(open_positions_rows)
+
+        rl_engine = RLExitEngine()
+        exit_decisions = rl_engine.decide(open_positions, candidates)
+        snapshot = build_snapshot(portfolio)
+
+        if not args.dry_run:
+            supabase_logger = SupabaseLogger()
+            trade_rows = []
+            now = pd.Timestamp.now("UTC").isoformat()
+            for _, r in pd.concat([exit_decisions, buy_decisions], ignore_index=True).iterrows():
+                trade_rows.append(
+                    {
+                        "timestamp": now,
+                        "symbol": str(r["symbol"]),
+                        "action": str(r["decision"]),
+                        "price": 0.0,
+                        "quantity": 0,
+                        "tqs": 0.0,
+                        "reason": str(r["reason"]),
+                    }
+                )
+            supabase_logger.log_paper_trades(trade_rows)
+            supabase_logger.log_portfolio_snapshots([snapshot])
+            if not rotation_log.empty:
+                rows = []
+                for _, row in rotation_log.iterrows():
+                    rows.append(
+                        {
+                            "timestamp": pd.Timestamp(row["timestamp"]).isoformat(),
+                            "old_symbol": str(row["old_symbol"]),
+                            "new_symbol": str(row["new_symbol"]),
+                            "old_tqs": float(row["old_tqs"]),
+                            "new_tqs": float(row["new_tqs"]),
+                        }
+                    )
+                supabase_logger.log_rotation(rows)
+
+        duration = time.monotonic() - cycle_started
+        trades_executed = len(exit_decisions) + len(buy_decisions)
+        exits_triggered = int((exit_decisions["decision"] == "SELL").sum()) if not exit_decisions.empty else 0
+        rotations_triggered = len(rotation_log)
+        update_cycle_metrics(
+            portfolio=portfolio,
+            trades_executed=trades_executed,
+            exits_triggered=exits_triggered,
+            rotations_triggered=rotations_triggered,
+            cycle_duration_seconds=duration,
+            last_processed_slot=args.slot,
+        )
+        logger.info(
+            "Cycle completion slot=%s duration_seconds=%.3f candidates=%s exits=%s buys=%s rotations=%s",
+            args.slot,
+            duration,
+            len(candidates),
+            len(exit_decisions),
+            len(buy_decisions),
+            rotations_triggered,
+        )
+
+    except Exception as exc:
+        record_cycle_error(str(exc))
+        logger.exception("Cycle failed slot=%s", args.slot)
+        raise
 
     print("Live cycle complete.")
     print(f"Candidates: {len(candidates)}")

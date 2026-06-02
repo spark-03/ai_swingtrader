@@ -1,0 +1,923 @@
+===== run_live_portfolio.py =====
+from __future__ import annotations
+
+import argparse
+import time
+
+import pandas as pd
+
+from paper_trading.live_candidate_engine import LiveCandidateEngine
+from paper_trading.logging_config import get_system_logger
+from paper_trading.metrics import record_cycle_error, record_cycle_start, update_cycle_metrics
+from paper_trading.portfolio_engine import PortfolioEngine
+from paper_trading.rl_exit_engine import RLExitEngine
+from paper_trading.rotation_engine import RotationEngine
+from paper_trading.state_manager import StateManager
+from paper_trading.supabase_logger import SupabaseLogger
+
+
+def fetch_latest_market_data() -> None:
+    # Placeholder: data refresh should be implemented via broker/API sync job.
+    # This orchestrator assumes data/historical/hourly/*.parquet is continuously updated.
+    return
+
+
+def apply_rl_exits(portfolio_df: pd.DataFrame, decisions_df: pd.DataFrame) -> pd.DataFrame:
+    print("portfolio_df.dtypes (before apply_rl_exits):")
+    print(portfolio_df.dtypes)
+
+    if portfolio_df.empty or decisions_df.empty:
+        return portfolio_df
+    if "exit_timestamp" not in portfolio_df.columns:
+     portfolio_df["exit_timestamp"] = pd.Series(dtype="object")
+
+    if "close_reason" not in portfolio_df.columns:
+     portfolio_df["close_reason"] = pd.Series(dtype="object")
+
+    portfolio_df["exit_timestamp"] = portfolio_df["exit_timestamp"].astype("object")
+    portfolio_df["close_reason"] = portfolio_df["close_reason"].astype("object")
+
+    sells = set(decisions_df[decisions_df["decision"] == "SELL"]["symbol"].tolist())
+    mask = (portfolio_df["status"] == "OPEN") & (portfolio_df["symbol"].isin(sells))
+    print("\nSELL SYMBOLS:")
+    print(sells)
+
+    print("\nPORTFOLIO SYMBOLS:")
+    print(portfolio_df["symbol"].tolist())
+
+    print("\nMATCHES:")
+    print(mask.sum())
+    portfolio_df.loc[mask, "status"] = "CLOSED_RL"
+    portfolio_df.loc[mask, "close_reason"] = "rl_exit"
+    portfolio_df.loc[mask, "exit_timestamp"] = pd.Timestamp.now("UTC").floor("s")
+
+    print('portfolio_df[["symbol","exit_timestamp"]].dtypes:')
+    print(portfolio_df[["symbol", "exit_timestamp"]].dtypes)
+
+    return portfolio_df
+
+
+def build_snapshot(portfolio_df: pd.DataFrame) -> dict:
+    now = pd.Timestamp.now("UTC")
+    open_positions = portfolio_df[portfolio_df["status"] == "OPEN"].copy() if not portfolio_df.empty else pd.DataFrame()
+    invested = float((open_positions["entry_price"] * open_positions["quantity"]).sum()) if not open_positions.empty else 0.0
+    total_capital = 1_000_000.0
+    cash = total_capital - invested
+    equity = total_capital
+    return {
+        "timestamp": now.isoformat(),
+        "cash": cash,
+        "equity": equity,
+        "positions": int(len(open_positions)),
+        "daily_pnl": 0.0,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run live paper trading cycle.")
+    parser.add_argument("--dry-run", action="store_true", help="Skip Supabase writes.")
+    parser.add_argument("--slot", default=None, help="Processed candle slot in YYYY-MM-DD HH format.")
+    args = parser.parse_args()
+    logger = get_system_logger("paper_trading.live_cycle")
+    state_manager = StateManager()
+    cycle_started = time.monotonic()
+    record_cycle_start()
+    logger.info("Cycle start slot=%s dry_run=%s", args.slot, args.dry_run)
+
+    try:
+        fetch_latest_market_data()
+
+        candidate_engine = LiveCandidateEngine()
+        candidates = candidate_engine.generate_candidates()
+
+        portfolio_engine = PortfolioEngine()
+        portfolio = portfolio_engine.update_from_candidates(candidates)
+        open_positions = portfolio[portfolio["status"] == "OPEN"].copy() if not portfolio.empty else pd.DataFrame()
+
+        rl_engine = RLExitEngine()
+        exit_decisions = rl_engine.decide(open_positions, candidates)
+        portfolio = apply_rl_exits(portfolio, exit_decisions)
+
+        open_positions = portfolio[portfolio["status"] == "OPEN"].copy() if not portfolio.empty else pd.DataFrame()
+        free_slots = max(0, 3 - len(open_positions))
+        buy_decisions = rl_engine.candidate_entries(open_positions, candidates, free_slots)
+
+        rotation_engine = RotationEngine()
+        portfolio, rotation_log = rotation_engine.evaluate_and_rotate(portfolio, candidates)
+        state_manager.save_portfolio(portfolio)
+        print("\nPORTFOLIO SHAPE:", portfolio.shape)
+        print(portfolio.head(20))
+        print("\nOPEN POSITIONS:", len(portfolio[portfolio["status"] == "OPEN"]))
+        print("STEP 1 - Portfolio Loaded")
+
+        rl_engine = RLExitEngine()
+
+        print("STEP 2 - RL Engine Created")
+
+        exit_decisions = rl_engine.decide(open_positions, candidates)
+
+        print("STEP 3 - RL Decisions Generated")
+        print(exit_decisions.head())
+        snapshot = build_snapshot(portfolio)
+
+        if not args.dry_run:
+            supabase_logger = SupabaseLogger()
+            trade_rows = []
+            now = pd.Timestamp.now("UTC").isoformat()
+            for _, r in pd.concat([exit_decisions, buy_decisions], ignore_index=True).iterrows():
+                trade_rows.append(
+                    {
+                        "timestamp": now,
+                        "symbol": str(r["symbol"]),
+                        "action": str(r["decision"]),
+                        "price": 0.0,
+                        "quantity": 0,
+                        "tqs": 0.0,
+                        "reason": str(r["reason"]),
+                    }
+                )
+            supabase_logger.log_paper_trades(trade_rows)
+            supabase_logger.log_portfolio_snapshots([snapshot])
+            if not rotation_log.empty:
+                rows = []
+                for _, row in rotation_log.iterrows():
+                    rows.append(
+                        {
+                            "timestamp": pd.Timestamp(row["timestamp"]).isoformat(),
+                            "old_symbol": str(row["old_symbol"]),
+                            "new_symbol": str(row["new_symbol"]),
+                            "old_tqs": float(row["old_tqs"]),
+                            "new_tqs": float(row["new_tqs"]),
+                        }
+                    )
+                supabase_logger.log_rotation(rows)
+
+        duration = time.monotonic() - cycle_started
+        trades_executed = len(exit_decisions) + len(buy_decisions)
+        exits_triggered = int((exit_decisions["decision"] == "SELL").sum()) if not exit_decisions.empty else 0
+        rotations_triggered = len(rotation_log)
+        update_cycle_metrics(
+            portfolio=portfolio,
+            trades_executed=trades_executed,
+            exits_triggered=exits_triggered,
+            rotations_triggered=rotations_triggered,
+            cycle_duration_seconds=duration,
+            last_processed_slot=args.slot,
+        )
+        logger.info(
+            "Cycle completion slot=%s duration_seconds=%.3f candidates=%s exits=%s buys=%s rotations=%s",
+            args.slot,
+            duration,
+            len(candidates),
+            len(exit_decisions),
+            len(buy_decisions),
+            rotations_triggered,
+        )
+
+    except Exception as exc:
+        record_cycle_error(str(exc))
+        logger.exception("Cycle failed slot=%s", args.slot)
+        raise
+
+    print("Live cycle complete.")
+    print(f"Candidates: {len(candidates)}")
+    print(f"Exit decisions: {len(exit_decisions)}")
+    print(f"Buy decisions: {len(buy_decisions)}")
+    print("Saved: logs/live_candidates.csv")
+    print("Saved: current_portfolio.csv")
+
+
+if __name__ == "__main__":
+    main()
+===== rl_exit_engine.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+RL_OBSERVATION_FEATURES = [
+    "bars_since_entry",
+    "pnl_pct",
+    "peak_pnl_so_far",
+    "drawdown_from_peak",
+    "momentum_score",
+    "trend_strength",
+    "volatility_score",
+    "compression_score",
+    "momentum_persistence",
+    "higher_low_strength",
+    "price_position",
+    "ATR",
+    "ema_spread",
+    "delta_momentum_1",
+    "delta_trend_1",
+    "delta_ema_spread_1",
+    "delta_price_position_1",
+    "delta_momentum_3",
+    "delta_trend_3",
+    "delta_ema_spread_3",
+]
+
+
+@dataclass
+class RLExitConfig:
+    model_path: Path = Path("models/rl_trade_exit_agent_tqs25.zip")
+
+
+class RLExitEngine:
+    def __init__(self, config: RLExitConfig | None = None) -> None:
+        self.config = config or RLExitConfig()
+        self.model = self._load_model()
+        self.expected_dim = len(RL_OBSERVATION_FEATURES)
+
+        if self.model is not None and hasattr(self.model, "observation_space"):
+            shape = getattr(self.model.observation_space, "shape", None)
+            if shape and len(shape) == 1 and shape[0] is not None:
+                self.expected_dim = int(shape[0])
+
+        print(f"Expected RL shape: ({self.expected_dim},)")
+
+    def _load_model(self) -> Any:
+        try:
+            from stable_baselines3 import DQN
+
+            if self.config.model_path.exists():
+                return DQN.load(str(self.config.model_path))
+
+        except Exception:
+            return None
+
+        return None
+
+    @staticmethod
+    def _safe_float(v: Any) -> float:
+        try:
+            if pd.isna(v):
+                return 0.0
+            return float(v)
+        except Exception:
+            return 0.0
+
+    def _build_state(
+        self,
+        row: pd.Series,
+        bars_since_entry: int,
+        pnl_pct: float,
+    ) -> np.ndarray:
+
+        momentum = self._safe_float(row.get("momentum_score", 0.0))
+        trend = self._safe_float(row.get("trend_strength", 0.0))
+        ema_spread = self._safe_float(row.get("ema_spread", 0.0))
+        price_position = self._safe_float(row.get("price_position", 0.0))
+
+        vals = [
+            float(bars_since_entry),
+            float(pnl_pct),
+            max(float(pnl_pct), 0.0),
+            min(float(pnl_pct), 0.0),
+            momentum,
+            trend,
+            self._safe_float(row.get("volatility_score", 0.0)),
+            self._safe_float(row.get("compression_score", 0.0)),
+            self._safe_float(row.get("momentum_persistence", 0.0)),
+            self._safe_float(row.get("higher_low_strength", 0.0)),
+            price_position,
+            self._safe_float(row.get("ATR", 0.0)),
+            ema_spread,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ]
+
+        return np.asarray(vals, dtype=np.float32)
+
+    def decide(
+        self,
+        open_positions: pd.DataFrame,
+        latest_candidates: pd.DataFrame,
+    ) -> pd.DataFrame:
+
+        if open_positions.empty:
+            return pd.DataFrame(
+                columns=["timestamp", "symbol", "decision", "reason"]
+            )
+
+        candidates_idx = (
+            latest_candidates.set_index("symbol")
+            if not latest_candidates.empty
+            else pd.DataFrame()
+        )
+
+        decisions: list[dict] = []
+
+        for _, pos in open_positions.iterrows():
+
+            symbol = str(pos["symbol"])
+
+            joined = {}
+
+            if not candidates_idx.empty and symbol in candidates_idx.index:
+                joined = candidates_idx.loc[symbol].to_dict()
+
+            entry_price = float(pos.get("entry_price", 0.0))
+            last_price = float(joined.get("last_price", entry_price))
+
+            unreal = (
+                ((last_price - entry_price) / entry_price) * 100.0
+                if entry_price > 0
+                else 0.0
+            )
+
+            entry_ts = pd.to_datetime(
+                pos.get("entry_timestamp"),
+                errors="coerce",
+            )
+
+            now_ts = pd.Timestamp.now(
+                tz="Asia/Kolkata"
+            )
+
+            if pd.notna(entry_ts):
+
+                if entry_ts.tzinfo is None:
+                    entry_ts = entry_ts.tz_localize(
+                        "Asia/Kolkata"
+                    )
+                else:
+                    entry_ts = entry_ts.tz_convert(
+                        "Asia/Kolkata"
+                    )
+
+                delta_hours = max(
+                    (now_ts - entry_ts).total_seconds() / 3600.0,
+                    0.0,
+                )
+
+                bars_since_entry = max(
+                    1,
+                    int(round(delta_hours / 2.0))
+                )
+
+            else:
+                bars_since_entry = 1
+
+            row = pd.Series(joined)
+
+            if self.model is None:
+
+                decision = (
+                    "SELL"
+                    if unreal < -3.0
+                    else "HOLD"
+                )
+
+                reason = "heuristic_fallback"
+
+            else:
+
+                state = self._build_state(
+                    row,
+                    bars_since_entry=bars_since_entry,
+                    pnl_pct=unreal,
+                )
+
+                print(f"Actual RL shape: {state.shape}")
+
+                assert len(state) == self.expected_dim, (
+                    f"Unexpected RL state length {len(state)}; "
+                    f"expected {self.expected_dim}."
+                )
+
+                action, _ = self.model.predict(
+                    state,
+                    deterministic=True,
+                )
+
+                decision = (
+                    "SELL"
+                    if int(action) == 1
+                    else "HOLD"
+                )
+
+                reason = "rl_model"
+
+            decisions.append(
+                {
+                    "timestamp": pd.Timestamp.utcnow(),
+                    "symbol": symbol,
+                    "decision": decision,
+                    "reason": reason,
+                }
+            )
+
+        return pd.DataFrame(decisions)
+
+    def candidate_entries(
+        self,
+        open_positions: pd.DataFrame,
+        latest_candidates: pd.DataFrame,
+        free_slots: int,
+    ) -> pd.DataFrame:
+
+        if free_slots <= 0 or latest_candidates.empty:
+            return pd.DataFrame(
+                columns=["timestamp", "symbol", "decision", "reason"]
+            )
+
+        open_symbols = (
+            set(open_positions["symbol"].tolist())
+            if not open_positions.empty
+            else set()
+        )
+
+        buys = []
+
+        for _, row in (
+            latest_candidates
+            .sort_values("pqs", ascending=False)
+            .iterrows()
+        ):
+
+            if len(buys) >= free_slots:
+                break
+
+            symbol = str(row["symbol"])
+
+            if symbol in open_symbols:
+                continue
+
+            buys.append(
+                {
+                    "timestamp": pd.Timestamp.utcnow(),
+                    "symbol": symbol,
+                    "decision": "BUY",
+                    "reason": "ranked_candidate",
+                }
+            )
+
+        return pd.DataFrame(buys)
+===== rotation_engine.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import pandas as pd
+
+from paper_trading.common import ensure_parent
+
+
+@dataclass
+class RotationConfig:
+    gap: float = 0.25
+    rotation_log_file: Path = Path("logs/rotation_log.csv")
+
+
+class RotationEngine:
+    def __init__(self, config: RotationConfig | None = None) -> None:
+        self.config = config or RotationConfig()
+
+    def evaluate_and_rotate(
+        self,
+        portfolio_df: pd.DataFrame,
+        candidates_df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+
+        if portfolio_df.empty or candidates_df.empty:
+            return portfolio_df, pd.DataFrame(
+                columns=[
+                    "timestamp",
+                    "old_symbol",
+                    "new_symbol",
+                    "old_tqs",
+                    "new_tqs",
+                ]
+            )
+
+        open_mask = portfolio_df["status"] == "OPEN"
+        open_positions = portfolio_df[open_mask].copy()
+
+        if open_positions.empty:
+            return portfolio_df, pd.DataFrame(
+                columns=[
+                    "timestamp",
+                    "old_symbol",
+                    "new_symbol",
+                    "old_tqs",
+                    "new_tqs",
+                ]
+            )
+
+        holding = open_positions.sort_values("pqs", ascending=True).iloc[0]
+
+        open_symbols = set(
+            open_positions["symbol"].tolist()
+        )
+
+        ranked_candidates = candidates_df.sort_values(
+            "pqs",
+            ascending=False
+        )
+
+        best_candidate = None
+
+        for _, candidate in ranked_candidates.iterrows():
+
+            candidate_symbol = str(candidate["symbol"])
+
+            if candidate_symbol in open_symbols:
+                continue
+
+            best_candidate = candidate
+            break
+
+        if best_candidate is None:
+            return portfolio_df, pd.DataFrame(
+                columns=[
+                    "timestamp",
+                    "old_symbol",
+                    "new_symbol",
+                    "old_tqs",
+                    "new_tqs",
+                ]
+            )
+
+        old_tqs = float(holding["pqs"])
+        new_tqs = float(best_candidate["pqs"])
+        old_symbol = str(holding["symbol"])
+        new_symbol = str(best_candidate["symbol"])
+
+        logs = []
+
+        if new_symbol != old_symbol and new_tqs > old_tqs + self.config.gap:
+
+            idx = holding.name
+
+            portfolio_df.loc[idx, "status"] = "CLOSED_ROTATION"
+            portfolio_df.loc[idx, "close_reason"] = "rotation"
+            portfolio_df.loc[idx, "exit_timestamp"] = pd.Timestamp.utcnow()
+
+            entry = {
+                "symbol": new_symbol,
+                "entry_timestamp": pd.Timestamp.utcnow(),
+                "entry_price": float(best_candidate.get("last_price", 0.0)),
+                "quantity": int(holding["quantity"]),
+                "slot_id": int(holding["slot_id"]),
+                "slot_capital": float(holding["slot_capital"]),
+                "pqs": new_tqs,
+                "status": "OPEN",
+            }
+
+            portfolio_df = pd.concat(
+                [portfolio_df, pd.DataFrame([entry])],
+                ignore_index=True,
+            )
+
+            logs.append(
+                {
+                    "timestamp": pd.Timestamp.utcnow(),
+                    "old_symbol": old_symbol,
+                    "new_symbol": new_symbol,
+                    "old_tqs": old_tqs,
+                    "new_tqs": new_tqs,
+                }
+            )
+
+        log_df = pd.DataFrame(logs)
+
+        if not log_df.empty:
+            self._append_logs(log_df)
+
+        return portfolio_df, log_df
+
+    def _append_logs(self, new_logs: pd.DataFrame) -> None:
+        ensure_parent(self.config.rotation_log_file)
+
+        if self.config.rotation_log_file.exists():
+            old = pd.read_csv(self.config.rotation_log_file)
+            out = pd.concat([old, new_logs], ignore_index=True)
+        else:
+            out = new_logs
+
+        out.to_csv(self.config.rotation_log_file, index=False)
+===== portfolio_engine.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import pandas as pd
+
+from paper_trading.common import TradingConfig
+from paper_trading.logging_config import get_system_logger
+from paper_trading.state_manager import StateManager
+
+
+@dataclass
+class PortfolioEngineConfig:
+    candidates_file: Path = Path("logs/live_candidates.csv")
+    portfolio_file: Path = Path("current_portfolio.csv")
+    initial_capital: float = 1_000_000.0
+    slots: tuple[float, float, float] = (500_000.0, 300_000.0, 200_000.0)
+    max_positions: int = 3
+
+
+class PortfolioEngine:
+    def __init__(self, config: PortfolioEngineConfig | None = None) -> None:
+        self.config = config or PortfolioEngineConfig()
+        self.trading_config = TradingConfig(
+            initial_capital=self.config.initial_capital,
+            slots=self.config.slots,
+            max_positions=self.config.max_positions,
+        )
+        self.state_manager = StateManager(portfolio_file=self.config.portfolio_file)
+        self.logger = get_system_logger("paper_trading.portfolio")
+
+    def _load_existing(self) -> pd.DataFrame:
+        df = self.state_manager.load_portfolio()
+        if not df.empty and "entry_timestamp" in df.columns:
+            df["entry_timestamp"] = pd.to_datetime(df["entry_timestamp"], errors="coerce")
+        return df
+
+    def _free_slots(self, open_positions: pd.DataFrame) -> list[tuple[int, float]]:
+        used = set(open_positions["slot_id"].tolist()) if not open_positions.empty else set()
+        free = []
+        for i, capital in enumerate(self.trading_config.slots, start=1):
+            if i not in used:
+                free.append((i, float(capital)))
+        free.sort(key=lambda x: x[1], reverse=True)
+        return free
+
+    def update_from_candidates(self, candidates: pd.DataFrame | None = None) -> pd.DataFrame:
+        if candidates is None:
+            candidates = pd.read_csv(self.config.candidates_file)
+        if not candidates.empty and "timestamp" in candidates.columns:
+            candidates["timestamp"] = pd.to_datetime(candidates["timestamp"], errors="coerce")
+
+        portfolio = self._load_existing()
+        if portfolio.empty:
+            portfolio = pd.DataFrame(
+                columns=[
+                    "symbol",
+                    "entry_timestamp",
+                    "entry_price",
+                    "quantity",
+                    "slot_id",
+                    "slot_capital",
+                    "pqs",
+                    "status",
+                ]
+            )
+
+        open_positions = portfolio[portfolio["status"] == "OPEN"].copy()
+        free_slots = self._free_slots(open_positions)
+        if candidates.empty or not free_slots:
+            self.state_manager.save_portfolio(portfolio)
+            self.logger.info("Portfolio update saved rows=%s open_positions=%s", len(portfolio), len(open_positions))
+            return portfolio
+
+        open_symbols = set(open_positions["symbol"].tolist())
+        ranked = candidates.sort_values("pqs", ascending=False)
+
+        for _, row in ranked.iterrows():
+            if not free_slots:
+                break
+            symbol = str(row["symbol"])
+            if symbol in open_symbols:
+                continue
+
+            slot_id, slot_cap = free_slots.pop(0)
+            price = float(row.get("last_price", 0.0))
+            if price <= 0:
+                continue
+            qty = int(slot_cap // price)
+            if qty <= 0:
+                continue
+            entry = {
+                "symbol": symbol,
+                "entry_timestamp": row["timestamp"],
+                "entry_price": price,
+                "quantity": qty,
+                "slot_id": slot_id,
+                "slot_capital": slot_cap,
+                "pqs": float(row["pqs"]),
+                "status": "OPEN",
+            }
+            portfolio = pd.concat([portfolio, pd.DataFrame([entry])], ignore_index=True)
+            open_symbols.add(symbol)
+
+            if len(portfolio[portfolio["status"] == "OPEN"]) >= self.trading_config.max_positions:
+                break
+
+        self.state_manager.save_portfolio(portfolio)
+        self.logger.info(
+            "Portfolio update saved rows=%s open_positions=%s",
+            len(portfolio),
+            int((portfolio["status"] == "OPEN").sum()),
+        )
+        return portfolio
+
+
+def main() -> None:
+    engine = PortfolioEngine()
+    out = engine.update_from_candidates()
+    print(f"Portfolio rows: {len(out)}")
+    print("Saved: current_portfolio.csv")
+
+
+if __name__ == "__main__":
+    main()
+
+===== state_manager.py =====
+from __future__ import annotations
+
+import shutil
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+import pandas as pd
+
+from paper_trading.retry_utils import retry_call
+
+
+PORTFOLIO_COLUMNS = [
+    "symbol",
+    "entry_timestamp",
+    "entry_price",
+    "quantity",
+    "slot_id",
+    "slot_capital",
+    "pqs",
+    "status",
+]
+
+
+@dataclass
+class StateManager:
+    portfolio_file: Path = Path("current_portfolio.csv")
+    last_processed_slot_file: Path = Path("logs/last_processed_slot.txt")
+    backup_dir: Path = Path("logs/state_backups")
+    retry_attempts: int = 3
+
+    def __post_init__(self) -> None:
+        self.portfolio_file = Path(self.portfolio_file)
+        self.last_processed_slot_file = Path(self.last_processed_slot_file)
+        self.backup_dir = Path(self.backup_dir)
+        self.portfolio_file.parent.mkdir(parents=True, exist_ok=True)
+        self.last_processed_slot_file.parent.mkdir(parents=True, exist_ok=True)
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_files()
+
+    def _ensure_files(self) -> None:
+        if not self.portfolio_file.exists():
+            self.save_portfolio(pd.DataFrame(columns=PORTFOLIO_COLUMNS), create_backup=False)
+        if not self.last_processed_slot_file.exists():
+            self.save_last_processed_slot("", create_backup=False)
+
+    def _timestamp_suffix(self) -> str:
+        return datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+
+    def _backup_file(self, path: Path, reason: str = "bak") -> Path | None:
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+
+        backup_path = self.backup_dir / f"{path.name}.{reason}.{self._timestamp_suffix()}"
+        shutil.copy2(path, backup_path)
+        return backup_path
+
+    def _atomic_write_text(self, path: Path, text: str) -> None:
+        def write_once() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(f".{path.name}.{self._timestamp_suffix()}.tmp")
+            tmp_path.write_text(text, encoding="utf-8")
+            tmp_path.replace(path)
+
+        retry_call(write_once, attempts=self.retry_attempts, retry_exceptions=(OSError,))
+
+    def _atomic_write_dataframe(self, path: Path, df: pd.DataFrame) -> None:
+        def write_once() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(f".{path.name}.{self._timestamp_suffix()}.tmp")
+            df.to_csv(tmp_path, index=False)
+            tmp_path.replace(path)
+
+        retry_call(write_once, attempts=self.retry_attempts, retry_exceptions=(OSError,))
+
+    def load_portfolio(self) -> pd.DataFrame:
+        try:
+            if not self.portfolio_file.exists() or self.portfolio_file.stat().st_size == 0:
+                portfolio = pd.DataFrame(columns=PORTFOLIO_COLUMNS)
+                self.save_portfolio(portfolio, create_backup=False)
+                return portfolio
+
+            portfolio = pd.read_csv(self.portfolio_file)
+            for column in PORTFOLIO_COLUMNS:
+                if column not in portfolio.columns:
+                    portfolio[column] = pd.NA
+            return portfolio
+        except Exception:
+            self._backup_file(self.portfolio_file, reason="corrupt")
+            portfolio = pd.DataFrame(columns=PORTFOLIO_COLUMNS)
+            self.save_portfolio(portfolio, create_backup=False)
+            return portfolio
+
+    def save_portfolio(self, portfolio: pd.DataFrame, *, create_backup: bool = True) -> None:
+        if create_backup:
+            self._backup_file(self.portfolio_file)
+        self._atomic_write_dataframe(self.portfolio_file, portfolio)
+
+    def load_last_processed_slot(self) -> str | None:
+        try:
+            if not self.last_processed_slot_file.exists():
+                self.save_last_processed_slot("", create_backup=False)
+                return None
+
+            slot = self.last_processed_slot_file.read_text(encoding="utf-8").strip()
+            return slot or None
+        except Exception:
+            self._backup_file(self.last_processed_slot_file, reason="corrupt")
+            self.save_last_processed_slot("", create_backup=False)
+            return None
+
+    def save_last_processed_slot(self, slot: str, *, create_backup: bool = True) -> None:
+        if create_backup:
+            self._backup_file(self.last_processed_slot_file)
+        body = f"{slot.strip()}\n" if slot.strip() else ""
+        self._atomic_write_text(self.last_processed_slot_file, body)
+===== supabase_logger.py =====
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Any
+
+import requests
+
+from paper_trading.logging_config import get_system_logger
+from paper_trading.retry_utils import retry_call
+
+
+@dataclass
+class SupabaseConfig:
+    url: str
+    key: str
+
+    @classmethod
+    def from_env(cls) -> "SupabaseConfig":
+        url = os.getenv("SUPABASE_URL", "").strip()
+        key = os.getenv("SUPABASE_KEY", "").strip()
+        if not url or not key:
+            raise ValueError("SUPABASE_URL and SUPABASE_KEY are required.")
+        return cls(url=url.rstrip("/"), key=key)
+
+
+class SupabaseLogger:
+    def __init__(self, config: SupabaseConfig | None = None) -> None:
+        self.config = config or SupabaseConfig.from_env()
+        self.logger = get_system_logger("paper_trading.supabase")
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "apikey": self.config.key,
+                "Authorization": f"Bearer {self.config.key}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            }
+        )
+
+    def _insert_rows(self, table: str, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        endpoint = f"{self.config.url}/rest/v1/{table}"
+
+        def insert_once() -> None:
+            resp = self.session.post(endpoint, json=rows, timeout=20)
+            resp.raise_for_status()
+
+        retry_call(
+            insert_once,
+            attempts=int(os.getenv("SUPABASE_MAX_RETRIES", "3")),
+            initial_delay=float(os.getenv("SUPABASE_RETRY_INITIAL_DELAY", "1.0")),
+            backoff=float(os.getenv("SUPABASE_RETRY_BACKOFF", "2.0")),
+            retry_exceptions=(requests.RequestException,),
+        )
+        self.logger.info("Supabase insert table=%s rows=%s", table, len(rows))
+
+    def log_paper_trades(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("paper_trades", rows)
+
+    def log_portfolio_snapshots(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("portfolio_snapshots", rows)
+
+    def log_rotation(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("rotation_log", rows)
+

@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pandas as pd
 
-from paper_trading.common import TradingConfig, ensure_parent
+from paper_trading.common import TradingConfig
+from paper_trading.logging_config import get_system_logger
+from paper_trading.state_manager import StateManager
 
 
 @dataclass
@@ -25,14 +27,14 @@ class PortfolioEngine:
             slots=self.config.slots,
             max_positions=self.config.max_positions,
         )
+        self.state_manager = StateManager(portfolio_file=self.config.portfolio_file)
+        self.logger = get_system_logger("paper_trading.portfolio")
 
     def _load_existing(self) -> pd.DataFrame:
-        if self.config.portfolio_file.exists():
-            df = pd.read_csv(self.config.portfolio_file)
-            if not df.empty and "entry_timestamp" in df.columns:
-                df["entry_timestamp"] = pd.to_datetime(df["entry_timestamp"], errors="coerce")
-            return df
-        return pd.DataFrame()
+        df = self.state_manager.load_portfolio()
+        if not df.empty and "entry_timestamp" in df.columns:
+            df["entry_timestamp"] = pd.to_datetime(df["entry_timestamp"], errors="coerce")
+        return df
 
     def _free_slots(self, open_positions: pd.DataFrame) -> list[tuple[int, float]]:
         used = set(open_positions["slot_id"].tolist()) if not open_positions.empty else set()
@@ -67,8 +69,8 @@ class PortfolioEngine:
         open_positions = portfolio[portfolio["status"] == "OPEN"].copy()
         free_slots = self._free_slots(open_positions)
         if candidates.empty or not free_slots:
-            ensure_parent(self.config.portfolio_file)
-            portfolio.to_csv(self.config.portfolio_file, index=False)
+            self.state_manager.save_portfolio(portfolio)
+            self.logger.info("Portfolio update saved rows=%s open_positions=%s", len(portfolio), len(open_positions))
             return portfolio
 
         open_symbols = set(open_positions["symbol"].tolist())
@@ -104,8 +106,12 @@ class PortfolioEngine:
             if len(portfolio[portfolio["status"] == "OPEN"]) >= self.trading_config.max_positions:
                 break
 
-        ensure_parent(self.config.portfolio_file)
-        portfolio.to_csv(self.config.portfolio_file, index=False)
+        self.state_manager.save_portfolio(portfolio)
+        self.logger.info(
+            "Portfolio update saved rows=%s open_positions=%s",
+            len(portfolio),
+            int((portfolio["status"] == "OPEN").sum()),
+        )
         return portfolio
 
 

@@ -156,14 +156,23 @@ def fetch_recent_hourly_data(
     symbol_token: str,
     existing_2h_file: Path,
     days_bootstrap: int = 45,
-    days_incremental: int = 7,
+    days_incremental: int = 2,
     pause_sec: float = 0.05,
 ) -> pd.DataFrame:
     now_ist = datetime.now(IST)
     if existing_2h_file.exists():
-        from_dt = now_ist - timedelta(days=days_incremental)
+        latest_2h = latest_2h_timestamp(existing_2h_file)
+        if latest_2h is not None:
+            from_dt = next_expected_2h_start(latest_2h)
+        else:
+            from_dt = now_ist - timedelta(days=days_incremental)
     else:
         from_dt = now_ist - timedelta(days=days_bootstrap)
+
+    # Keep the incremental window tiny but not brittle. If the local file is
+    # stale by many sessions, the loop below still walks forward from from_dt.
+    if from_dt > now_ist:
+        return pd.DataFrame(columns=["datetime", "open", "high", "low", "close", "volume"])
 
     # Chunk requests to reduce SmartAPI window errors on long ranges.
     frames: list[pd.DataFrame] = []
@@ -181,6 +190,53 @@ def fetch_recent_hourly_data(
     out = pd.concat(frames, ignore_index=True)
     out = out.sort_values("datetime").drop_duplicates(subset=["datetime"]).reset_index(drop=True)
     return out
+
+
+def latest_2h_timestamp(existing_2h_file: Path) -> datetime | None:
+    try:
+        if not existing_2h_file.exists() or existing_2h_file.stat().st_size == 0:
+            return None
+        df = pd.read_parquet(existing_2h_file, columns=["datetime"])
+    except Exception:
+        backup_path = existing_2h_file.with_suffix(existing_2h_file.suffix + ".corrupt.bak")
+        try:
+            existing_2h_file.replace(backup_path)
+        except Exception:
+            pass
+        return None
+
+    if df.empty or "datetime" not in df.columns:
+        return None
+
+    timestamps = pd.to_datetime(df["datetime"], errors="coerce").dropna()
+    if timestamps.empty:
+        return None
+
+    latest = pd.Timestamp(timestamps.max())
+    if latest.tzinfo is None:
+        latest = latest.tz_localize(IST)
+    else:
+        latest = latest.tz_convert(IST)
+    return latest.to_pydatetime()
+
+
+def next_expected_2h_start(latest_2h_timestamp: datetime) -> datetime:
+    ts = latest_2h_timestamp
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=IST)
+    else:
+        ts = ts.astimezone(IST)
+
+    clock = ts.time()
+    if clock < datetime.strptime("11:15", "%H:%M").time():
+        return ts.replace(hour=11, minute=15, second=0, microsecond=0)
+    if clock < datetime.strptime("13:15", "%H:%M").time():
+        return ts.replace(hour=13, minute=15, second=0, microsecond=0)
+
+    next_day = ts + timedelta(days=1)
+    while next_day.weekday() >= 5:
+        next_day += timedelta(days=1)
+    return next_day.replace(hour=9, minute=15, second=0, microsecond=0)
 
 
 def build_2h_bars_from_hourly(hourly_df: pd.DataFrame) -> pd.DataFrame:

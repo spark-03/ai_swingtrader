@@ -18,17 +18,70 @@ class RotationEngine:
     def __init__(self, config: RotationConfig | None = None) -> None:
         self.config = config or RotationConfig()
 
-    def evaluate_and_rotate(self, portfolio_df: pd.DataFrame, candidates_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def evaluate_and_rotate(
+        self,
+        portfolio_df: pd.DataFrame,
+        candidates_df: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+
         if portfolio_df.empty or candidates_df.empty:
-            return portfolio_df, pd.DataFrame(columns=["timestamp", "old_symbol", "new_symbol", "old_tqs", "new_tqs"])
+            return portfolio_df, pd.DataFrame(
+                columns=[
+                    "timestamp",
+                    "old_symbol",
+                    "new_symbol",
+                    "old_tqs",
+                    "new_tqs",
+                ]
+            )
 
         open_mask = portfolio_df["status"] == "OPEN"
         open_positions = portfolio_df[open_mask].copy()
+
         if open_positions.empty:
-            return portfolio_df, pd.DataFrame(columns=["timestamp", "old_symbol", "new_symbol", "old_tqs", "new_tqs"])
+            return portfolio_df, pd.DataFrame(
+                columns=[
+                    "timestamp",
+                    "old_symbol",
+                    "new_symbol",
+                    "old_tqs",
+                    "new_tqs",
+                ]
+            )
 
         holding = open_positions.sort_values("pqs", ascending=True).iloc[0]
-        best_candidate = candidates_df.sort_values("pqs", ascending=False).iloc[0]
+
+        open_symbols = set(
+            open_positions["symbol"].tolist()
+        )
+
+        ranked_candidates = candidates_df.sort_values(
+            "pqs",
+            ascending=False
+        )
+
+        best_candidate = None
+
+        for _, candidate in ranked_candidates.iterrows():
+
+            candidate_symbol = str(candidate["symbol"])
+
+            if candidate_symbol in open_symbols:
+                continue
+
+            best_candidate = candidate
+            break
+
+        if best_candidate is None:
+            return portfolio_df, pd.DataFrame(
+                columns=[
+                    "timestamp",
+                    "old_symbol",
+                    "new_symbol",
+                    "old_tqs",
+                    "new_tqs",
+                ]
+            )
 
         old_tqs = float(holding["pqs"])
         new_tqs = float(best_candidate["pqs"])
@@ -36,8 +89,11 @@ class RotationEngine:
         new_symbol = str(best_candidate["symbol"])
 
         logs = []
+
         if new_symbol != old_symbol and new_tqs > old_tqs + self.config.gap:
+
             idx = holding.name
+
             portfolio_df.loc[idx, "status"] = "CLOSED_ROTATION"
             portfolio_df.loc[idx, "close_reason"] = "rotation"
             portfolio_df.loc[idx, "exit_timestamp"] = pd.Timestamp.utcnow()
@@ -52,7 +108,11 @@ class RotationEngine:
                 "pqs": new_tqs,
                 "status": "OPEN",
             }
-            portfolio_df = pd.concat([portfolio_df, pd.DataFrame([entry])], ignore_index=True)
+
+            portfolio_df = pd.concat(
+                [portfolio_df, pd.DataFrame([entry])],
+                ignore_index=True,
+            )
 
             logs.append(
                 {
@@ -65,16 +125,19 @@ class RotationEngine:
             )
 
         log_df = pd.DataFrame(logs)
+
         if not log_df.empty:
             self._append_logs(log_df)
+
         return portfolio_df, log_df
 
     def _append_logs(self, new_logs: pd.DataFrame) -> None:
         ensure_parent(self.config.rotation_log_file)
+
         if self.config.rotation_log_file.exists():
             old = pd.read_csv(self.config.rotation_log_file)
             out = pd.concat([old, new_logs], ignore_index=True)
         else:
             out = new_logs
-        out.to_csv(self.config.rotation_log_file, index=False)
 
+        out.to_csv(self.config.rotation_log_file, index=False)

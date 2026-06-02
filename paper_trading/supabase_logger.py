@@ -1,10 +1,15 @@
 from __future__ import annotations
-
-import os
 from dataclasses import dataclass
 from typing import Any
 
 import requests
+
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+from paper_trading.logging_config import get_system_logger
+from paper_trading.retry_utils import retry_call
 
 
 @dataclass
@@ -24,6 +29,7 @@ class SupabaseConfig:
 class SupabaseLogger:
     def __init__(self, config: SupabaseConfig | None = None) -> None:
         self.config = config or SupabaseConfig.from_env()
+        self.logger = get_system_logger("paper_trading.supabase")
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -38,8 +44,19 @@ class SupabaseLogger:
         if not rows:
             return
         endpoint = f"{self.config.url}/rest/v1/{table}"
-        resp = self.session.post(endpoint, json=rows, timeout=20)
-        resp.raise_for_status()
+
+        def insert_once() -> None:
+            resp = self.session.post(endpoint, json=rows, timeout=20)
+            resp.raise_for_status()
+
+        retry_call(
+            insert_once,
+            attempts=int(os.getenv("SUPABASE_MAX_RETRIES", "3")),
+            initial_delay=float(os.getenv("SUPABASE_RETRY_INITIAL_DELAY", "1.0")),
+            backoff=float(os.getenv("SUPABASE_RETRY_BACKOFF", "2.0")),
+            retry_exceptions=(requests.RequestException,),
+        )
+        self.logger.info("Supabase insert table=%s rows=%s", table, len(rows))
 
     def log_paper_trades(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("paper_trades", rows)
@@ -49,4 +66,7 @@ class SupabaseLogger:
 
     def log_rotation(self, rows: list[dict[str, Any]]) -> None:
         self._insert_rows("rotation_log", rows)
-
+    def log_pqs_rankings(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("pqs_rankings", rows)
+    def log_open_positions(self, rows: list[dict[str, Any]]) -> None:
+        self._insert_rows("open_positions", rows)
