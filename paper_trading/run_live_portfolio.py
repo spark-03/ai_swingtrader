@@ -39,13 +39,51 @@ def apply_rl_exits(portfolio_df: pd.DataFrame, decisions_df: pd.DataFrame) -> pd
     portfolio_df["realized_pnl_pct"] = pd.Series(dtype="float64")
     portfolio_df["exit_timestamp"] = portfolio_df["exit_timestamp"].astype("object")
     portfolio_df["close_reason"] = portfolio_df["close_reason"].astype("object")
-
+    candidate_prices = (
+    candidates_df[["symbol", "last_price"]]
+    .drop_duplicates(subset=["symbol"])
+    .set_index("symbol")["last_price"]
+    .to_dict()
+    )
     sells = set(decisions_df[decisions_df["decision"] == "SELL"]["symbol"].tolist())
     mask = (portfolio_df["status"] == "OPEN") & (portfolio_df["symbol"].isin(sells))
     
     portfolio_df.loc[mask, "status"] = "CLOSED_RL"
-    portfolio_df.loc[mask, "close_reason"] = "rl_exit"
-    portfolio_df.loc[mask, "exit_timestamp"] = pd.Timestamp.now("UTC").floor("s")
+portfolio_df.loc[mask, "close_reason"] = "rl_exit"
+portfolio_df.loc[mask, "exit_timestamp"] = pd.Timestamp.now("UTC").floor("s")
+
+for idx in portfolio_df[mask].index:
+
+    symbol = str(portfolio_df.at[idx, "symbol"])
+
+    entry_price = float(
+        portfolio_df.at[idx, "entry_price"]
+    )
+
+    quantity = int(
+        portfolio_df.at[idx, "quantity"]
+    )
+
+    exit_price = float(
+        candidate_prices.get(
+            symbol,
+            entry_price
+        )
+    )
+
+    realized_pnl = (
+        exit_price - entry_price
+    ) * quantity
+
+    realized_pnl_pct = (
+        ((exit_price - entry_price) / entry_price) * 100
+        if entry_price > 0
+        else 0.0
+    )
+
+    portfolio_df.at[idx, "exit_price"] = exit_price
+    portfolio_df.at[idx, "realized_pnl"] = realized_pnl
+    portfolio_df.at[idx, "realized_pnl_pct"] = realized_pnl_pct
 
     return portfolio_df
 
