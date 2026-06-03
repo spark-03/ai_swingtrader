@@ -1,4 +1,4 @@
-from __future__ import annotations
+
 from paper_trading.supabase_logger import SupabaseLogger
 import concurrent.futures as cf
 import os
