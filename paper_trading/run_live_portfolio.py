@@ -43,19 +43,68 @@ def apply_rl_exits(portfolio_df: pd.DataFrame, decisions_df: pd.DataFrame) -> pd
     return portfolio_df
 
 
-def build_snapshot(portfolio_df: pd.DataFrame) -> dict:
+def build_snapshot(
+    portfolio_df: pd.DataFrame,
+    candidates: pd.DataFrame,
+) -> dict:
+
     now = pd.Timestamp.now("UTC")
-    open_positions = portfolio_df[portfolio_df["status"] == "OPEN"].copy() if not portfolio_df.empty else pd.DataFrame()
-    invested = float((open_positions["entry_price"] * open_positions["quantity"]).sum()) if not open_positions.empty else 0.0
+
     total_capital = 1_000_000.0
+
+    open_positions = (
+        portfolio_df[portfolio_df["status"] == "OPEN"].copy()
+        if not portfolio_df.empty
+        else pd.DataFrame()
+    )
+
+    if open_positions.empty:
+        return {
+            "timestamp": now.isoformat(),
+            "cash": total_capital,
+            "equity": total_capital,
+            "positions": 0,
+            "daily_pnl": 0.0,
+        }
+
+    candidate_prices = (
+        candidates[["symbol", "last_price"]]
+        .drop_duplicates(subset=["symbol"])
+        .set_index("symbol")["last_price"]
+        .to_dict()
+    )
+
+    invested = 0.0
+    market_value = 0.0
+
+    for _, row in open_positions.iterrows():
+
+        entry_price = float(row["entry_price"])
+        quantity = int(row["quantity"])
+
+        invested += entry_price * quantity
+
+        current_price = float(
+            candidate_prices.get(
+                str(row["symbol"]),
+                entry_price,
+            )
+        )
+
+        market_value += current_price * quantity
+
+    unrealized_pnl = market_value - invested
+
     cash = total_capital - invested
-    equity = total_capital
+
+    equity = cash + market_value
+
     return {
         "timestamp": now.isoformat(),
         "cash": cash,
         "equity": equity,
         "positions": int(len(open_positions)),
-        "daily_pnl": 0.0,
+        "daily_pnl": unrealized_pnl,
     }
 
 
