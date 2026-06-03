@@ -237,7 +237,10 @@ def main() -> None:
 
         rl_engine = RLExitEngine()
         exit_decisions = rl_engine.decide(open_positions, candidates)
-        snapshot = build_snapshot(portfolio)
+        snapshot = build_snapshot(
+          portfolio,
+          candidates,
+        )
 
         if not args.dry_run:
             supabase_logger = SupabaseLogger()
