@@ -53,6 +53,7 @@ def apply_rl_exits(portfolio_df: pd.DataFrame, decisions_df: pd.DataFrame) -> pd
 def build_snapshot(
     portfolio_df: pd.DataFrame,
     candidates: pd.DataFrame,
+    candidates_df: pd.DataFrame
 ) -> dict:
 
     now = pd.Timestamp.now("UTC")
