@@ -1,8 +1,3 @@
-Here is the complete code with all 6 of your structural updates integrated correctly.
-
-The `apply_rl_exits` function signature now accepts `candidates_df`, initializes your financial metrics safely with proper indentation, extracts prices inside the exit logic, processes all exits iteratively via individual row indices, and waits to return the portfolio until the loop finishes. `build_snapshot` has also been streamlined to match its exact call signature.
-
-```python
 from __future__ import annotations
 
 import argparse
@@ -229,8 +224,6 @@ def main() -> None:
 
             supabase_logger.log_open_positions(open_positions_rows)
 
-        rl_engine = RLExitEngine()
-        exit_decisions = rl_engine.decide(open_positions, candidates)
         snapshot = build_snapshot(portfolio, candidates)
 
         if not args.dry_run:
@@ -302,5 +295,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-```
