@@ -29,7 +29,14 @@ def apply_rl_exits(portfolio_df: pd.DataFrame, decisions_df: pd.DataFrame) -> pd
 
     if "close_reason" not in portfolio_df.columns:
         portfolio_df["close_reason"] = pd.Series(dtype="object")
+    if "exit_price" not in portfolio_df.columns:
+    portfolio_df["exit_price"] = pd.Series(dtype="float64")
 
+    if "realized_pnl" not in portfolio_df.columns:
+    portfolio_df["realized_pnl"] = pd.Series(dtype="float64")
+
+    if "realized_pnl_pct" not in portfolio_df.columns:
+    portfolio_df["realized_pnl_pct"] = pd.Series(dtype="float64")
     portfolio_df["exit_timestamp"] = portfolio_df["exit_timestamp"].astype("object")
     portfolio_df["close_reason"] = portfolio_df["close_reason"].astype("object")
 
