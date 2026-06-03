@@ -208,7 +208,7 @@ def main() -> None:
 
         rl_engine = RLExitEngine()
         exit_decisions = rl_engine.decide(open_positions, candidates)
-        portfolio = apply_rl_exits(portfolio, exit_decisions)
+        portfolio = apply_rl_exits(portfolio, exit_decisions,candidates,)
 
         open_positions = portfolio[portfolio["status"] == "OPEN"].copy() if not portfolio.empty else pd.DataFrame()
         free_slots = max(0, 3 - len(open_positions))
