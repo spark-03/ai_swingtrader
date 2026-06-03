@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from paper_trading.supabase_logger import SupabaseLogger
 import concurrent.futures as cf
 import os
 import time
@@ -135,6 +135,13 @@ def _process_symbol_once(
         return UpdateResult(now, symbol, 0, 0.0, "FAILED", "Insufficient rolling 2H window")
 
     saved_file = save_symbol_2h_parquet(symbol, merged)
+
+    supabase = SupabaseLogger()
+    supabase.upsert_market_candles(
+    symbol,
+    merged,
+)
+
     validation = validate_parquet_file(saved_file)
     if validation.status == "FAIL":
         return UpdateResult(now, symbol, 0, 0.0, "FAILED", validation.error)
