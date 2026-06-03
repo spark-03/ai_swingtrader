@@ -12,7 +12,7 @@ from paper_trading.rotation_engine import RotationEngine
 
 
 def _write_sample_hourly_parquet(path: Path, symbol: str) -> None:
-    dt = pd.date_range("2026-01-01 09:15:00", periods=240, freq="H")
+    dt = pd.date_range("2026-01-01 09:15:00", periods=240, freq="h")
     df = pd.DataFrame(
         {
             "datetime": dt,
@@ -34,10 +34,10 @@ def run_smoke() -> None:
         hourly.mkdir(parents=True, exist_ok=True)
         logs.mkdir(parents=True, exist_ok=True)
 
-        _write_sample_hourly_parquet(hourly, "AAA")
-        _write_sample_hourly_parquet(hourly, "BBB")
-        _write_sample_hourly_parquet(hourly, "CCC")
-        _write_sample_hourly_parquet(hourly, "DDD")
+        _write_sample_hourly_parquet(hourly, "360ONE-EQ")
+        _write_sample_hourly_parquet(hourly, "3MINDIA-EQ")
+        _write_sample_hourly_parquet(hourly, "AADHARHFC-EQ")
+        _write_sample_hourly_parquet(hourly, "AARTIIND-EQ")
 
         cands_file = logs / "live_candidates.csv"
         candidates = LiveCandidateEngine(
